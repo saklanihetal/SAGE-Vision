@@ -1,0 +1,17 @@
+# Virtual Environments (Local isolated development spaces)
+.venv/
+test_env/
+__pycache__/
+*.pyc
+
+# Local Image Datasets
+datasets/
+
+# Large Machine Learning Weights (Never commit binaries to GitHub)
+*.tflite
+*.pt
+*.onnx
+
+# Live Execution Telemetry Outputs
+*.csv
+pi_optimization_logs.csv
