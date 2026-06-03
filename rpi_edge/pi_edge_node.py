@@ -27,7 +27,7 @@ DISTANCE_NEAR_GATE = 150.0 # Low-resolution boundary (cm)
 
 # Hardware and Server Node Configurations
 SERIAL_INTERFACE = "/dev/ttyUSB0"  
-LAPTOP_SERVER_IP = "192.168.1.50"   # UPDATE with your laptop's actual IP address
+LAPTOP_SERVER_IP = "192.168.1.50"   # ⚠️ UPDATE with your laptop's actual IP address
 NETWORK_PORT = 8080
 
 # Initialize local TFLite engine
@@ -71,7 +71,6 @@ def serial_harvester_worker():
                 raw_packet = ser.readline().decode('utf-8', errors='ignore').rstrip()
                 metrics = raw_packet.split(',')
                 
-                # FIXED TYPO: Explicitly verifying boundaries and indexing token strings
                 if len(metrics) == 3:
                     pir_val = int(metrics[0])
                     dist_val = float(metrics[1])
@@ -102,8 +101,8 @@ def adaptive_vision_streamer():
     camera_feed.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     camera_feed.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
     
-    # Unified Packed Binary Output Definition: 24 Bytes structural space
-    udp_format = "<B f f f H f B 4B"
+    # Unified Packed Binary Output Definition: Exactly 40 Bytes structural space
+    udp_format = "<B f f f H f B 4B 4f"
     
     while True:
         with state_mutex:
@@ -116,7 +115,11 @@ def adaptive_vision_streamer():
         if not ((pir == 1) or (time.time() - last_motion < PIR_COOLDOWN_WINDOW)):
             cpu_pct, cpu_c = get_pi_hardware_metrics()
             # Mode 0 = Standby profile configuration
-            standby_payload = struct.pack(udp_format, 0, cpu_pct, cpu_c, distance, 0, 0.0, 0, 255, 255, 255, 255)
+            standby_payload = struct.pack(
+                udp_format, 
+                0, cpu_pct, cpu_c, distance, 0, 0.0, 
+                0, 255, 255, 255, 255, 0.0, 0.0, 0.0, 0.0
+            )
             try:
                 network_socket.sendto(standby_payload, (LAPTOP_SERVER_IP, NETWORK_PORT))
             except Exception: pass
@@ -146,25 +149,34 @@ def adaptive_vision_streamer():
         
         # E. Extract and Clean Detected Object Labels
         detected_classes = []
+        detected_confidences = []
+        
         for result in inference_results:
-            # FIXED BUG: Using valid cross-hardware PyTorch tensor type conversion safely
             if result.boxes is not None and len(result.boxes) > 0:
+                # Fixed Tensor Space Bug: safely using .cpu().int() and .float()
                 tensor_classes = result.boxes.cls.cpu().int().tolist()
+                tensor_confs = result.boxes.conf.cpu().float().tolist()
+                
                 detected_classes.extend(tensor_classes)
+                detected_confidences.extend(tensor_confs)
                     
         # F. Pull Hardware Diagnostics and Transmit Log Telemetry
         detection_count = min(len(detected_classes), 4)
+        
         padded_classes = [255, 255, 255, 255]
+        padded_confidences = [0.0, 0.0, 0.0, 0.0]
+        
         for i in range(detection_count):
             padded_classes[i] = detected_classes[i]
+            padded_confidences[i] = detected_confidences[i]
             
-        cpu_pct, cpu_c = get_pi_hardware_metrics()
+        cpu_pct, cpu_c = get_pi_hardware_metrics() # get cpu_usage and cpu_temp for telemetry
         
-        # FIXED BUG: Using the '*' operator unpacks the array elements into individual arguments inline
+        # Fixed Struct Packing Bug: safely unpacking inline arrays using * operator lists
         active_payload = struct.pack(
             udp_format,
             1, cpu_pct, cpu_c, distance, img_inference_size, inference_duration_ms,
-            detection_count, *padded_classes
+            detection_count, *padded_classes, *padded_confidences
         )
         
         try:
