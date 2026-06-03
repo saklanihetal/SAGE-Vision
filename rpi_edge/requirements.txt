@@ -3,4 +3,4 @@ opencv-python>=4.8.0
 numpy>=1.24.0
 psutil>=5.9.0
 ultralytics>=8.2.0
-tflite-runtime>=2.14.0
+# tflite-runtime is intentionally excluded — ultralytics manages TFLite internally

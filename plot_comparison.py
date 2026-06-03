@@ -236,5 +236,4 @@ def generate_evaluation_dashboard():
 
 
 if __name__ == "__main__":
-    generate_evaluation_plots = generate_system_dashboard = generate_evaluation_dashboard
     generate_evaluation_dashboard()

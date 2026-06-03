@@ -1,3 +1,4 @@
+import glob
 import os
 import sys
 import time
@@ -30,6 +31,10 @@ SERIAL_INTERFACE = "/dev/ttyUSB0"
 LAPTOP_SERVER_IP = "192.168.1.50"   # ⚠️ UPDATE with your laptop's actual IP address
 NETWORK_PORT = 8080
 
+# Fixed Struct Packing Definition for Incoming Sensor Data
+SENSOR_PACKET_FMT  = "<B H f"   # little-endian: uint8, uint16, float
+SENSOR_PACKET_SIZE = struct.calcsize(SENSOR_PACKET_FMT)   # = 7 bytes
+
 # Initialize local TFLite engine
 try:
     yolo_model = YOLO("yolov8n_full_integer_quant.tflite", task="detect")
@@ -53,36 +58,45 @@ def get_pi_hardware_metrics():
 # =======================================================
 # THREAD 1: ASYNCHRONOUS USB SERIAL HARVESTER (CORE 1)
 # =======================================================
+def find_esp32_serial_port():
+    """Auto-detect the ESP32 serial port from common Linux device paths."""
+    candidates = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
+    if candidates:
+        port = sorted(candidates)[0]
+        print(f"[SYSTEM] Auto-detected ESP32 serial port: {port}", flush=True)
+        return port
+    # Fallback to the configured default
+    return SERIAL_INTERFACE
+
 def serial_harvester_worker():
     os.sched_setaffinity(0, {1})
-    print(f"[SYSTEM] Serial Harvester thread successfully pinned to CPU Core {os.sched_getaffinity(0)}", flush=True)
-    
+    print(f"[SYSTEM] Serial Harvester pinned to CPU Core {os.sched_getaffinity(0)}", flush=True)
+
     try:
-        ser = serial.Serial(SERIAL_INTERFACE, 115200, timeout=1)
-        ser.flush()
+        ser = serial.Serial(find_esp32_serial_port(), 115200, timeout=1)
+        ser.reset_input_buffer()
     except Exception as hardware_err:
-        print(f"[FATAL] USB Serial node unreadable at {SERIAL_INTERFACE}: {hardware_err}", flush=True)
+        print(f"[FATAL] USB Serial unreadable at {find_esp32_serial_port()}: {hardware_err}", flush=True)
         sys.exit(1)
-        
+
     global shared_state
     while True:
         try:
-            if ser.in_waiting > 0:
-                raw_packet = ser.readline().decode('utf-8', errors='ignore').rstrip()
-                metrics = raw_packet.split(',')
-                
-                if len(metrics) == 3:
-                    pir_val = int(metrics[0])
-                    dist_val = float(metrics[1])
-                    ldr_val = int(metrics[2])
-                    
-                    with state_mutex:
-                        shared_state["pir"] = pir_val
-                        if dist_val > 0:  
-                            shared_state["distance"] = dist_val
-                        shared_state["ldr"] = ldr_val
-                        if pir_val == 1:
-                            shared_state["last_motion_epoch"] = time.time()
+            # Read exactly 7 bytes — the size of one packed SensorPacket
+            raw_bytes = ser.read(SENSOR_PACKET_SIZE)
+            if len(raw_bytes) != SENSOR_PACKET_SIZE:
+                continue  # Incomplete read (e.g. timeout), skip silently
+
+            pir_val, ldr_val, dist_val = struct.unpack(SENSOR_PACKET_FMT, raw_bytes)
+
+            with state_mutex:
+                shared_state["pir"] = pir_val
+                if dist_val > 0:
+                    shared_state["distance"] = dist_val
+                shared_state["ldr"] = ldr_val
+                if pir_val == 1:
+                    shared_state["last_motion_epoch"] = time.time()
+
         except Exception as loop_fault:
             print(f"[SERIAL ALERT] Intermittent telemetry loss: {loop_fault}", flush=True)
             time.sleep(0.2)
