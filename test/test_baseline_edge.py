@@ -7,9 +7,9 @@ import psutil
 from datetime import datetime
 from ultralytics import YOLO
 
+LOG_FILE_NAME = "baseline_optimization_logs.csv"
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_WEIGHTS_PATH = os.path.join(_SCRIPT_DIR, "..", "rpi_edge", "yolov8n_full_integer_quant.tflite")
-
 # Comprehensive COCO dataset index mapping optimized for CS Lab environments
 COCO_LABELS = {
     0: "Student/Person",
