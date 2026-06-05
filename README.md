@@ -73,18 +73,55 @@ Each node does exactly one thing well, and a failure in one node degrades gracef
 
 ---
 
-## The Three Adaptive Gates
+## Finite State Machine & Sensor Core Management
 
-All three gates are evaluated on every vision loop iteration, in order of priority:
+The edge vision node uses a five-state finite state machine. Each state has explicit entry and exit conditions, making the system's behavior deterministic and auditable. The architecture eliminates resolution thrashing through hysteresis dead bands, filters ultrasonic noise through a rolling median window, and maintains a hardware failsafe that activates independently of all other state logic.
 
-### Gate 1 — PIR Standby Suppression
-If the PIR sensor reports no motion and the cooldown window (5 seconds) has expired, the vision loop sleeps for 1 second and transmits a standby packet. The camera is not read. The YOLO model is not invoked. CPU utilisation drops to single-digit percentages. This is the most impactful optimisation — in a real lab environment, the camera field of view is unoccupied for the majority of the day.
+---
 
-### Gate 2 — Ultrasonic Resolution Scaling
-When motion is detected, the ultrasonic sensor measures the distance to the nearest object. If the subject is closer than 150 cm, the inference input is downsampled to 320×320 pixels instead of 640×640. This reduces the pixel count fed to the model by 75%, cutting matrix multiplication workload proportionally and dropping per-frame latency significantly. At close range the object occupies a large fraction of the frame, so the lower resolution does not meaningfully reduce detection confidence.
+### The five states
 
-### Gate 3 — LDR CLAHE Low-Light Enhancement
-If the LDR reads below the dark threshold (350 out of 1023 on the mapped scale), the frame is converted to YUV colour space and a CLAHE (Contrast Limited Adaptive Histogram Equalisation) filter is applied to the Y (luminance) channel before inference. This compensates for poor ambient lighting without globally brightening the image, preserving the fine local contrast needed for accurate bounding-box localisation.
+**Sleep**
+
+The system is fully idle. No camera frames are captured and the inference pipeline is completely bypassed. The CPU governor drops to powersave. This state is entered only when both sensors simultaneously agree the space is vacant: the PIR cooldown has expired with no motion detected for at least five continuous seconds, and the rolling median ultrasonic distance reads above 350 cm. Both conditions must hold — either sensor alone registering presence is sufficient to prevent entry. The system exits Sleep the instant either condition breaks: a new PIR trigger or median distance dropping below 350 cm. Exit always routes through Standby; there is no direct transition to an Active state.
+
+**Standby**
+
+A transient warmup state lasting exactly one 200 ms execution tick. No inference runs. Its purpose is to absorb hardware stabilization time before the first inference frame fires: the CPU governor is raised, serial buffers are flushed, and the camera's auto-exposure arrays are given time to settle. After the single tick, the machine evaluates median distance and routes immediately to Active-Lo or Active-Hi. Standby also serves as the mandatory re-entry point after recovering from Watchdog, ensuring sensor data is fresh before any resolution decision is made.
+
+**Active-Lo**
+
+Runs YOLOv8n INT8 inference at 320×320 resolution with a 10 ms loop pace for responsive close-range tracking. Entered from Standby when median distance is below 120 cm. At close range, the subject occupies a large portion of the frame and 320×320 provides sufficient pixel density for reliable detection. To prevent thrashing at the boundary, the system holds this state until distance rises above 160 cm — it will not scale up at 120 cm. Presence loss (PIR cooldown expired and distance above 350 cm) transitions directly to Sleep.
+
+**Active-Hi**
+
+Runs YOLOv8n INT8 inference at 640×640 resolution with a 400 ms loop pace to conserve processing cycles. Entered from Standby when median distance is at or above 160 cm, or when the subject sits in the 120–160 cm overlap zone as the safe default. At range, the subject occupies a small pixel footprint — dropping to 320×320 here risks the detection falling below confidence threshold entirely. The system holds this state until distance drops below 120 cm. Presence loss transitions directly to Sleep.
+
+**Watchdog**
+
+A failsafe override that operates independently of all other state logic and takes unconditional priority. Entered when either of two data-integrity conditions is met: the time elapsed since the last valid serial frame exceeds 2.0 seconds, or the asynchronous reader thread registers three or more consecutive dropped or corrupted packets. While active, the system runs at maximum capability — 640×640 resolution with CLAHE permanently enabled — regardless of any cached sensor values, since those values can no longer be trusted. The only exit path is a successfully validated incoming packet. On exit, the machine routes through Standby before resuming normal resolution decisions.
+
+---
+
+### Hysteresis zones
+
+Two sensors use asymmetric entry and exit thresholds to prevent state oscillation caused by sensor noise near decision boundaries.
+
+1. The ultrasonic distance gate uses a 40 cm dead band: the system enters Active-Lo below 120 cm and exits it only above 160 cm. Within the 120–160 cm band, the current state is held regardless of new readings.
+
+2. The LDR light gate uses a 70-count dead band: CLAHE activates when the LDR value drops below 350 and deactivates only when it rises above 420. This prevents preprocessing from toggling on and off under flickering or transitional lighting conditions.
+
+---
+
+### Ultrasonic median filter
+
+The HC-SR04 ultrasonic sensor produces measurement noise of ±5–10 cm at distances above one metre due to acoustic multipath reflections. Raw readings are never used directly in state logic. Instead, the ESP32 maintains a circular buffer of five consecutive distance samples and transmits only the median value each cycle. This eliminates spurious spikes without introducing meaningful latency at human-movement timescales.
+
+---
+
+### CLAHE preprocessing order
+
+Low-light enhancement runs orthogonally to resolution state. When active, the processing pipeline follows this fixed order: capture the full-resolution frame, apply CLAHE equalization, then resize to the target resolution, then run inference. Applying CLAHE before the resize ensures the contrast enhancement operates on maximum available pixel data. Reversing this order degrades enhancement quality by discarding spatial information before processing it.
 
 ---
 
