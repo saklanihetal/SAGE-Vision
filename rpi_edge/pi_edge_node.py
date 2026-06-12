@@ -116,7 +116,9 @@ def serial_harvester_worker():
             # DROPPED ENHANCEMENT: Catch incomplete or timed-out packet readings
             if len(raw_bytes) != SENSOR_PACKET_SIZE:
                 with state_mutex:
-                    consecutive_dropped_readings += 1
+                    consecutive_dropped_readings += 1 # consecutive_dropped_readings is used when the rpi takes longer 
+                    # to process the vision pipeline and misses incoming serial packets, or if there is a genuine hardware connectivity issue with the sensor stream. 
+                    # If we hit the threshold of 3 consecutive drops, the watchdog will trigger immediately to enter failsafe mode.
                 continue  # Skip processing line silently
 
             # Successful byte harvest, proceed to unpack binary network structures
