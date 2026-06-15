@@ -9,7 +9,7 @@ import threading
 import cv2
 import numpy as np
 import psutil
-from ultralytics import YOLO
+from yolo_tflite import YoloTFLite
 
 # =========================================================================
 # SECTION 1: GLOBAL STATE ENGINE CONFIGURATIONS & FINITE STATE MACHINE TOKENS
@@ -60,10 +60,16 @@ MODE_IDS = {
     STATE_WATCHDOG:  4
 }
 
-# Initialize local quantized TFLite engine [cite: 174]
+# Initialize local quantized TFLite engines. A full-integer INT8 model has a
+# fixed input resolution, so adaptive switching uses two interpreters: one at
+# 320x320 for ACTIVE-LO and one at 640x640 for ACTIVE-HI / WATCHDOG. [cite: 174]
+_MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_LO_PATH = os.path.join(_MODEL_DIR, "yolov8n_320_int8.tflite")
+MODEL_HI_PATH = os.path.join(_MODEL_DIR, "yolov8n_640_int8.tflite")
 try:
-    yolo_model = YOLO("yolov8n_full_integer_quant.tflite", task="detect")
-    print("[SYSTEM] TFLite INT8 YOLO engine successfully initialized.", flush=True)
+    model_lo = YoloTFLite(MODEL_LO_PATH)  # 320x320
+    model_hi = YoloTFLite(MODEL_HI_PATH)  # 640x640
+    print("[SYSTEM] TFLite INT8 YOLO engines (320 + 640) successfully initialized.", flush=True)
 except Exception as e:
     print(f"[FATAL] Failed to locate or parse TFLite model file: {e}", flush=True)
     sys.exit(1)
@@ -296,32 +302,24 @@ def adaptive_vision_streamer():
         else:
             processed_frame = raw_frame
 
-        # Resolve resolution size constraints and pacing rates [cite: 358, 360]
+        # Resolve resolution model, size constraints and pacing rates [cite: 358, 360]
         if current_state == STATE_ACTIVE_LO:
+            detector = model_lo
             img_inference_size = 320
             loop_pacing_rate = 0.01  # Target close: run highly responsive loop pacing
         elif current_state == STATE_ACTIVE_HI:
+            detector = model_hi
             img_inference_size = 640
             loop_pacing_rate = 0.40  # Target far: slow down pacing to preserve resources
         else:  # STATE_WATCHDOG
+            detector = model_hi
             img_inference_size = 640
             loop_pacing_rate = 0.10  # Failsafe fallback loop pacing rate
 
         # Run model inference and track math execution performance times
         start_inference = time.time()
-        inference_results = yolo_model(processed_frame, imgsz=img_inference_size, verbose=False)
+        detected_classes, detected_confidences = detector(processed_frame)
         inference_duration_ms = (time.time() - start_inference) * 1000.0
-
-        # Extract and compile target predictions safely
-        detected_classes = []
-        detected_confidences = []
-        
-        for result in inference_results:
-            if result.boxes is not None and len(result.boxes) > 0:
-                tensor_classes = result.boxes.cls.cpu().int().tolist()
-                tensor_confs = result.boxes.conf.cpu().float().tolist()
-                detected_classes.extend(tensor_classes)
-                detected_confidences.extend(tensor_confs)
 
         detection_count = min(len(detected_classes), 4)
         padded_classes = [255, 255, 255, 255]

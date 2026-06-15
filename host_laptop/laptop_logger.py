@@ -4,19 +4,26 @@ from datetime import datetime
 
 NETWORK_PORT = 8080
 
+# Contiguous YOLOv8 COCO 80-class index map (0-79). IDs are NOT the sparse
+# 91-class COCO paper IDs — YOLO remaps them to a dense 0-79 range.
 COCO_LABELS = {
     0: "Student/Person", 1: "Bicycle", 2: "Car", 3: "Motorcycle", 4: "Airplane",
-    5: "Bus", 6: "Train", 7: "Truck", 9: "Traffic Light", 11: "Fire Hydrant",
-    13: "Stop Sign", 14: "Parking Meter", 15: "Bench", 16: "Bird", 17: "Cat",
-    18: "Dog", 19: "Horse", 20: "Sheep", 21: "Cow", 22: "Elephant", 23: "Bear",
-    24: "Backpack", 25: "Umbrella", 26: "Handbag", 27: "Tie", 28: "Suitcase",
-    32: "Sports Ball", 39: "Water Bottle", 41: "Coffee Cup/Mug", 42: "Fork",
-    43: "Knife", 44: "Spoon", 45: "Bowl", 46: "Banana", 47: "Apple", 48: "Sandwich",
-    56: "Chair", 57: "Couch/Sofa", 58: "Potted Plant", 59: "Bed", 60: "Dining Table",
-    62: "Lab Monitor/TV", 63: "Laptop", 64: "Computer Mouse", 65: "Remote Control",
-    66: "Keyboard", 67: "Cell Phone", 68: "Microwave", 69: "Oven", 71: "Sink",
-    72: "Refrigerator", 73: "Book/Notebook", 74: "Clock", 75: "Vase", 76: "Scissors",
-    77: "Teddy Bear", 78: "Hair Drier", 79: "Toothbrush", 255: "None"
+    5: "Bus", 6: "Train", 7: "Truck", 8: "Boat", 9: "Traffic Light",
+    10: "Fire Hydrant", 11: "Stop Sign", 12: "Parking Meter", 13: "Bench", 14: "Bird",
+    15: "Cat", 16: "Dog", 17: "Horse", 18: "Sheep", 19: "Cow",
+    20: "Elephant", 21: "Bear", 22: "Zebra", 23: "Giraffe", 24: "Backpack",
+    25: "Umbrella", 26: "Handbag", 27: "Tie", 28: "Suitcase", 29: "Frisbee",
+    30: "Skis", 31: "Snowboard", 32: "Sports Ball", 33: "Kite", 34: "Baseball Bat",
+    35: "Baseball Glove", 36: "Skateboard", 37: "Surfboard", 38: "Tennis Racket", 39: "Water Bottle",
+    40: "Wine Glass", 41: "Coffee Cup/Mug", 42: "Fork", 43: "Knife", 44: "Spoon",
+    45: "Bowl", 46: "Banana", 47: "Apple", 48: "Sandwich", 49: "Orange",
+    50: "Broccoli", 51: "Carrot", 52: "Hot Dog", 53: "Pizza", 54: "Donut",
+    55: "Cake", 56: "Chair", 57: "Couch/Sofa", 58: "Potted Plant", 59: "Bed",
+    60: "Dining Table", 61: "Toilet", 62: "Lab Monitor/TV", 63: "Laptop", 64: "Computer Mouse",
+    65: "Remote Control", 66: "Keyboard", 67: "Cell Phone", 68: "Microwave", 69: "Oven",
+    70: "Toaster", 71: "Sink", 72: "Refrigerator", 73: "Book/Notebook", 74: "Clock",
+    75: "Vase", 76: "Scissors", 77: "Teddy Bear", 78: "Hair Drier", 79: "Toothbrush",
+    255: "None"
 }
 
 MODE_MAPPING = {

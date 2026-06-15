@@ -8,10 +8,9 @@ __pycache__/
 datasets/
 
 # Large Machine Learning Weights (Never commit binaries to GitHub)
-*.tflite
+#*.tflite
 *.pt
 *.onnx
 
-# Live Execution Telemetry Outputs
-*.csv
-pi_optimization_logs.csv
+# claude
+.claude/
