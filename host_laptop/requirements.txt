@@ -1,3 +1,3 @@
-pandas>=2.0.0
-matplotlib>=3.7.0
-numpy>=1.24.0
+# laptop_logger.py uses only the Python standard library (socket, struct,
+# datetime) — no third-party packages are required. This file is kept so the
+# documented `pip install -r host_laptop/requirements.txt` step stays valid.

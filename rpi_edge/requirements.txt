@@ -1,8 +1,11 @@
-pyserial>=3.5
+pigpio>=1.78
 opencv-python-headless>=4.8.0
 numpy>=1.24.0
 psutil>=5.9.0
 tflite-runtime>=2.14.0
+# pigpio drives the sensors directly off the Pi's GPIO (PIR, LM393, HC-SR04)
+# with hardware-timestamped echo edges. The pigpiod daemon must be running:
+#   sudo systemctl enable --now pigpiod   (or: sudo pigpiod)
 # tflite-runtime is the lightweight CPU-only interpreter used on the Pi.
 # ultralytics/torch are NOT installed on the edge node — model export to
 # .tflite is done off-device. See yolo_tflite.py for the inference pipeline.

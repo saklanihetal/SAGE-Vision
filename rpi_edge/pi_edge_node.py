@@ -1,14 +1,13 @@
-import glob
 import os
 import sys
 import time
-import serial
 import socket
 import struct
 import threading
 import cv2
 import numpy as np
 import psutil
+import pigpio
 from yolo_tflite import YoloTFLite
 
 # =========================================================================
@@ -22,11 +21,13 @@ STATE_ACTIVE_LO = "ACTIVE-LO"
 STATE_ACTIVE_HI = "ACTIVE-HI"
 STATE_WATCHDOG  = "WATCHDOG"
 
-# Initialize thread-safe shared state cache dictionary
+# Initialize thread-safe shared state cache dictionary. The LDR is now a digital
+# LM393 comparator (active-low), so light is a boolean dark/bright flag rather
+# than an analog value.
 shared_state = {
     "pir": 0,
     "distance": 400.0,  # Bounded initialized safe default far distance value
-    "ldr": 500,
+    "is_dark": False,
     "last_motion_epoch": time.time()
 }
 state_mutex = threading.Lock()
@@ -35,21 +36,16 @@ state_mutex = threading.Lock()
 DISTANCE_WINDOW_SIZE = 5
 distance_history = [400.0] * DISTANCE_WINDOW_SIZE
 
-# Heartbeat line tracking the exact epoch of the last SUCCESSFULLY parsed sensor packet
+# Heartbeat line tracking the exact epoch of the last completed ultrasonic echo
 last_valid_reading_time = time.time()
 
-# Failsafe limit: if we drop 3 consecutive packet reads, trigger WATCHDOG immediately
+# Failsafe limit: if 3 consecutive sonar triggers return no echo, trigger WATCHDOG
 MAX_CONSECUTIVE_DROPS = 3
 consecutive_dropped_readings = 0
 
-# Network routing parameters and fallback hardware ports
-SERIAL_INTERFACE = "/dev/ttyUSB0"  
+# Network routing parameters
 LAPTOP_SERVER_IP = "192.168.1.50"   # ⚠️ UPDATE with your laptop's actual IP address
 NETWORK_PORT = 8080
-
-# Fixed Struct Packing Definition for Incoming Sensor Data (Exactly 7 Bytes) [cite: 354, 355]
-SENSOR_PACKET_FMT  = "<B H f"   # little-endian: uint8 (PIR), uint16 (LDR), float (Distance)
-SENSOR_PACKET_SIZE = struct.calcsize(SENSOR_PACKET_FMT)
 
 # Mode ID mapping table for the 40-byte packed UDP payload network socket [cite: 177]
 MODE_IDS = {
@@ -89,72 +85,136 @@ def get_pi_hardware_metrics():
 
 
 # =========================================================================
-# THREAD 1: ASYNCHRONOUS USB SERIAL HARVESTER (PINNED TO CPU CORE 1)
+# THREAD 1: ASYNCHRONOUS GPIO SENSOR HARVESTER (PINNED TO CPU CORE 1)
 # =========================================================================
-def find_esp32_serial_port():
-    """Auto-detect the ESP32 serial port from common Linux device paths."""
-    candidates = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
-    if candidates:
-        port = sorted(candidates)[0]
-        print(f"[SYSTEM] Auto-detected ESP32 serial port: {port}", flush=True)
-        return port
-    return SERIAL_INTERFACE
+# Hardware GPIO pin map (BCM numbering). The HC-SR04 ECHO line is 5V and MUST
+# pass through a resistor voltage divider down to 3.3V before reaching the Pi.
+PIR_PIN  = 17   # PIR digital motion output
+LDR_PIN  = 27   # LM393 light comparator digital output (active-low: LOW = dark)
+TRIG_PIN = 23   # HC-SR04 trigger output
+ECHO_PIN = 24   # HC-SR04 echo input (via 5V -> 3.3V voltage divider)
+
+# Ultrasonic timing constants mirroring the original 16.6 Hz firmware cadence
+TRIGGER_INTERVAL_S = 0.060   # ~16.6 Hz sonar trigger pace
+ECHO_TIMEOUT_S     = 0.058   # TUNABLE: no echo within this window => dead sonar.
+                             # Must exceed your HC-SR04's no-object pulse length
+                             # (~38 ms datasheet; some clones stretch longer).
+
+# Echo pulse state shared between the pigpio edge callback and the harvester loop.
+# pigpio fires the callback from its own real-time thread (the equivalent of the
+# ESP32 IRAM ISR), so reads/writes are guarded by echo_lock (the critical section).
+echo_lock = threading.Lock()
+_echo_start_tick = 0
+_echo_pulse_ready = False
+_echo_duration_us = 0
+
+# Set when a pigpio/daemon call fails -> forces an immediate WATCHDOG (the
+# equivalent of the old "USB serial unplugged" detection).
+pigpio_fault = False
 
 
-def serial_harvester_worker():
-    # Pin this thread to CPU Core 1 to isolate UART serial parsing operations completely
+def _echo_edge_callback(gpio, level, tick):
+    """pigpio EITHER_EDGE callback: timestamps the HC-SR04 echo pulse width.
+
+    Mirrors the firmware ISR: rising edge stamps the start tick, falling edge
+    computes the pulse duration. pigpio.tickDiff handles the 32-bit microsecond
+    counter wraparound correctly.
+    """
+    global _echo_start_tick, _echo_pulse_ready, _echo_duration_us
+    with echo_lock:
+        if level == 1:            # rising edge: pulse start
+            _echo_start_tick = tick
+        elif level == 0:          # falling edge: pulse end
+            if _echo_start_tick != 0:
+                _echo_duration_us = pigpio.tickDiff(_echo_start_tick, tick)
+                _echo_start_tick = 0
+                _echo_pulse_ready = True
+
+
+def gpio_harvester_worker():
+    # Pin this thread to CPU Core 1 to isolate sensor sampling from inference jitter
     os.sched_setaffinity(0, {1})
-    print(f"[SYSTEM] Serial Harvester pinned to CPU Core {os.sched_getaffinity(0)}", flush=True)
+    print(f"[SYSTEM] GPIO Sensor Harvester pinned to CPU Core {os.sched_getaffinity(0)}", flush=True)
 
-    try:
-        ser = serial.Serial(find_esp32_serial_port(), 115200, timeout=1)
-        ser.reset_input_buffer()
-    except Exception as hardware_err:
-        print(f"[FATAL] USB Serial unreadable at {find_esp32_serial_port()}: {hardware_err}", flush=True)
+    global last_valid_reading_time, distance_history, consecutive_dropped_readings
+    global pigpio_fault, _echo_pulse_ready, _echo_duration_us
+
+    pi = pigpio.pi()  # connects to the local pigpiod daemon
+    if not pi.connected:
+        print("[FATAL] Cannot connect to pigpiod. Start it with 'sudo pigpiod'.", flush=True)
         sys.exit(1)
 
-    global shared_state, last_valid_reading_time, distance_history, consecutive_dropped_readings
+    pi.set_mode(TRIG_PIN, pigpio.OUTPUT)
+    pi.set_mode(ECHO_PIN, pigpio.INPUT)
+    pi.set_mode(PIR_PIN, pigpio.INPUT)
+    pi.set_mode(LDR_PIN, pigpio.INPUT)
+    pi.write(TRIG_PIN, 0)
+    pi.callback(ECHO_PIN, pigpio.EITHER_EDGE, _echo_edge_callback)
+
+    last_trigger = 0.0
+    awaiting_echo = False
+    trigger_sent_at = 0.0
+
     while True:
         try:
-            # Read exactly 7 bytes matching the layout of your packed SensorPacket
-            raw_bytes = ser.read(SENSOR_PACKET_SIZE)
-            
-            # DROPPED ENHANCEMENT: Catch incomplete or timed-out packet readings
-            if len(raw_bytes) != SENSOR_PACKET_SIZE:
+            now = time.monotonic()
+
+            # 1. Non-blocking periodic 10us trigger pulse (mirrors firmware cadence)
+            if now - last_trigger >= TRIGGER_INTERVAL_S:
+                last_trigger = now
+                pi.gpio_trigger(TRIG_PIN, 10, 1)   # 10 microsecond HIGH pulse
+                awaiting_echo = True
+                trigger_sent_at = now
+
+            # 2. Consume a completed echo transaction if one is ready
+            with echo_lock:
+                pulse_ready = _echo_pulse_ready
+                duration_us = _echo_duration_us
+                _echo_pulse_ready = False
+
+            if pulse_ready:
+                awaiting_echo = False
+                dist_cm = (duration_us * 0.0343) / 2.0
+                # Outlier rejection + out-of-range sentinel (identical to firmware)
+                if dist_cm > 500.0 or dist_cm <= 0:
+                    dist_cm = -1.0
+                # A COMPLETED echo (even out-of-range) is a valid heartbeat: the
+                # sonar is alive, so refresh the watchdog timer and clear drops.
                 with state_mutex:
-                    consecutive_dropped_readings += 1 # consecutive_dropped_readings is used when the rpi takes longer 
-                    # to process the vision pipeline and misses incoming serial packets, or if there is a genuine hardware connectivity issue with the sensor stream. 
-                    # If we hit the threshold of 3 consecutive drops, the watchdog will trigger immediately to enter failsafe mode.
-                continue  # Skip processing line silently
+                    if dist_cm > 0:
+                        distance_history.pop(0)
+                        distance_history.append(dist_cm)
+                        # True median removes spikes from ultrasonic echo multipath
+                        shared_state["distance"] = float(np.median(distance_history))
+                    consecutive_dropped_readings = 0
+                last_valid_reading_time = time.time()
 
-            # Successful byte harvest, proceed to unpack binary network structures
-            pir_val, ldr_val, dist_val = struct.unpack(SENSOR_PACKET_FMT, raw_bytes)
+            # 3. Sonar liveness: NO echo edges at all within the window => dead sensor
+            elif awaiting_echo and (now - trigger_sent_at) > ECHO_TIMEOUT_S:
+                awaiting_echo = False
+                with state_mutex:
+                    consecutive_dropped_readings += 1
 
+            # 4. Poll the level-read sensors (PIR motion, LM393 light). These are
+            #    not health-monitorable: a dead level pin reads a constant value
+            #    indistinguishable from a genuinely quiet/lit room.
+            pir_val = pi.read(PIR_PIN)
+            is_dark = (pi.read(LDR_PIN) == 0)   # active-low: LOW output = dark
             with state_mutex:
                 shared_state["pir"] = pir_val
-                shared_state["ldr"] = ldr_val
-                
-                # Apply incoming values to rolling window filter history array if reading is valid
-                if dist_val > 0:
-                    distance_history.pop(0)
-                    distance_history.append(dist_val)
-                    # Extract the true median to remove spikes caused by ultrasonic echoing anomalies
-                    shared_state["distance"] = float(np.median(distance_history))
-                    
+                shared_state["is_dark"] = is_dark
                 if pir_val == 1:
                     shared_state["last_motion_epoch"] = time.time()
 
-                # Reset consecutive drop counter back to 0 since a valid packet was completely parsed
-                consecutive_dropped_readings = 0
-
-            # Update the heartbeat tracker to the current valid execution time epoch
-            last_valid_reading_time = time.time()
+            pigpio_fault = False
+            time.sleep(0.01)   # light yield; pigpiod captures echo edges independently
 
         except Exception as loop_fault:
-            # Track any unexpected decoding exceptions or string bit corruptions
+            # A pigpio call failed (e.g. pigpiod died) -> flag immediate failsafe
+            pigpio_fault = True
             with state_mutex:
                 consecutive_dropped_readings += 1
-            print(f"[SERIAL ALERT] Intermittent telemetry loss or corrupted packet: {loop_fault}", flush=True)
+            print(f"[SENSOR ALERT] GPIO read fault or pigpiod connection lost: {loop_fault}", flush=True)
             time.sleep(0.2)
 
 
@@ -188,16 +248,17 @@ def adaptive_vision_streamer():
         # STEP A: WATCHDOG FAILSAFE OVERRIDE RULE EVALUATION (ENHANCED)
         # -----------------------------------------------------------------
         time_since_last_valid_read = time.time() - last_valid_reading_time
-        
+
         with state_mutex:
             drops_count = consecutive_dropped_readings
 
-        # Failsafe triggers if 2 seconds pass with no data OR if consecutive dropped packets hit the threshold
-        if time_since_last_valid_read > 2.0 or drops_count >= MAX_CONSECUTIVE_DROPS:
+        # Failsafe triggers on: lost pigpiod connection, 2s with no valid echo,
+        # OR consecutive sonar echo timeouts hitting the drop threshold.
+        if pigpio_fault or time_since_last_valid_read > 2.0 or drops_count >= MAX_CONSECUTIVE_DROPS:
             if current_state != STATE_WATCHDOG:
-                print(f"[WATCHDOG CRITICAL] Sensor stream compromised! "
-                      f"(Time elapsed: {time_since_last_valid_read:.1f}s, Consecutive drops: {drops_count}). "
-                      f"Entering Failsafe Mode.", flush=True)
+                print(f"[WATCHDOG CRITICAL] Sensor feed compromised! "
+                      f"(pigpio_fault={pigpio_fault}, elapsed: {time_since_last_valid_read:.1f}s, "
+                      f"consecutive drops: {drops_count}). Entering Failsafe Mode.", flush=True)
                 current_state = STATE_WATCHDOG
         elif current_state == STATE_WATCHDOG:
             print("[WATCHDOG RESOLVED] Heartbeat restored. Returning to STANDBY.", flush=True)
@@ -210,7 +271,7 @@ def adaptive_vision_streamer():
         with state_mutex:
             pir = shared_state["pir"]
             distance = shared_state["distance"]
-            ldr = shared_state["ldr"]
+            is_dark = shared_state["is_dark"]
             last_motion = shared_state["last_motion_epoch"]
             
         # Presence calculations: PIR expired (5s window) AND filtered distance > 350 cm
@@ -256,15 +317,15 @@ def adaptive_vision_streamer():
                 print(f"[FSM TRANSITION] ACTIVE-HI -> ACTIVE-LO. Target entered close-zone threshold (< 120cm).", flush=True)
 
         # -----------------------------------------------------------------
-        # STEP D: ASYMMETRIC ORTHOGONAL LDR PREPROCESSING GATE EVALUATION
+        # STEP D: ORTHOGONAL LDR PREPROCESSING GATE EVALUATION
         # -----------------------------------------------------------------
+        # The LM393 comparator supplies a clean digital dark/bright signal; its
+        # onboard potentiometer threshold and built-in comparator hysteresis now
+        # replace the former software dead-band entirely.
         if current_state == STATE_WATCHDOG:
             clahe_active = True  # Watchdog assumes worst-case low light automatically
         else:
-            if ldr < 350:
-                clahe_active = True
-            elif ldr > 420:
-                clahe_active = False
+            clahe_active = is_dark
 
         # -----------------------------------------------------------------
         # STEP E: OUTPUT PROFILE EXECUTION BASED ON CURRENT DRIVING STATE
@@ -348,7 +409,7 @@ def adaptive_vision_streamer():
 
 if __name__ == "__main__":
     print("[INIT] Launching 5-State Adaptive Video Edge Node Framework...", flush=True)
-    harvester_thread = threading.Thread(target=serial_harvester_worker, daemon=True)
+    harvester_thread = threading.Thread(target=gpio_harvester_worker, daemon=True)
     vision_thread = threading.Thread(target=adaptive_vision_streamer, daemon=True)
     
     harvester_thread.start()
