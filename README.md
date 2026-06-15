@@ -15,35 +15,32 @@ SAGE-Vision takes a different approach: **let the physical environment decide ho
 
 ## System Architecture
 
-The pipeline is split across three physical nodes connected over serial and UDP:
+The pipeline is split across two physical nodes. Sensors wire directly to the Raspberry Pi's GPIO header; the Pi reports to the laptop over UDP:
 
 ```
-┌─────────────────────────┐
-│   RV-IoT Board (ESP32)  │
-│                         │
-│  PIR  ── GPIO 25        │
-│  LDR  ── GPIO 39        │
-│  HC-SR04                │
-│    TRIG ── GPIO 26      │
-│    ECHO ── GPIO 27      │
-│    (via voltage divider) │
-└────────────┬────────────┘
-             │  7-byte packed binary struct
-             │  UART Serial @ 115200 baud
-             ▼
+   Sensors ── wired to Raspberry Pi GPIO header
+   ┌──────────────────────────────────────┐
+   │  PIR (HC-SR501)  OUT ── GPIO 17        │
+   │  LM393 light     DO  ── GPIO 27        │
+   │  HC-SR04  TRIG ── GPIO 23              │
+   │           ECHO ── GPIO 24 (divider)    │
+   └────────────────────┬───────────────────┘
+                        ▼
 ┌─────────────────────────┐
 │   Raspberry Pi 4B       │
 │                         │
 │  Thread 1 (Core 1)      │
-│   Serial harvester      │
-│   ── reads sensor data  │
+│   GPIO sensor harvester │
+│   ── pigpio: PIR / LM393│
+│      + HC-SR04 echo ISR │
+│   ── median-filters dist│
 │   ── updates shared     │
 │      state (mutex)      │
 │                         │
 │  Thread 2 (Cores 2+3)   │
 │   Adaptive vision loop  │
 │   ── PIR standby gate   │
-│   ── LDR CLAHE gate     │
+│   ── LM393 CLAHE gate   │
 │   ── Ultrasonic res gate│
 │   ── YOLOv8 INT8 TFLite │
 │   ── packs 40-byte UDP  │
@@ -57,19 +54,14 @@ The pipeline is split across three physical nodes connected over serial and UDP:
 │  laptop_logger.py       │
 │   ── decodes payload    │
 │   ── live terminal UI   │
-│   ── CSV log writer     │
-│                         │
-│  plot_comparison.py     │
-│   ── offline analysis   │
-│   ── 4-panel dashboard  │
 └─────────────────────────┘
 ```
 
 ### Why This Topology
 
-The workload split is deliberately asymmetric. The ESP32 is responsible only for sensor sampling — it runs an interrupt-driven ultrasonic measurement loop and polls the PIR and LDR on a 60 ms cycle, then blasts a 7-byte binary struct down the serial line. It never does any computation on the data. The Raspberry Pi handles all inference and all adaptive decision-making. The laptop handles only logging and visualisation, keeping its processing entirely offline from the inference loop so it adds zero latency.
+The Raspberry Pi reads the sensors directly off its GPIO header through the `pigpio` daemon, which captures the HC-SR04 echo edges with hardware timestamps in its own real-time thread — the equivalent of a microcontroller ISR, but without a second board or a serial link to keep in sync. Sensor sampling lives on a thread pinned to Core 1; all inference and adaptive decision-making run on a separate thread pinned to Cores 2 & 3. The laptop handles only logging and visualisation, keeping its processing entirely offline from the inference loop so it adds zero latency.
 
-Each node does exactly one thing well, and a failure in one node degrades gracefully rather than crashing the whole pipeline.
+The two on-Pi threads communicate only through a mutex-guarded latest-value snapshot, so a slow inference frame can never starve the sensor reader — and removing the ESP32 also removes a whole class of serial-framing and buffer-overflow failure modes.
 
 ---
 
@@ -87,7 +79,7 @@ The system is fully idle. No camera frames are captured and the inference pipeli
 
 **Standby**
 
-A transient warmup state lasting exactly one 200 ms execution tick. No inference runs. Its purpose is to absorb hardware stabilization time before the first inference frame fires: the CPU governor is raised, serial buffers are flushed, and the camera's auto-exposure arrays are given time to settle. After the single tick, the machine evaluates median distance and routes immediately to Active-Lo or Active-Hi. Standby also serves as the mandatory re-entry point after recovering from Watchdog, ensuring sensor data is fresh before any resolution decision is made.
+A transient warmup state lasting exactly one 200 ms execution tick. No inference runs. Its purpose is to absorb hardware stabilization time before the first inference frame fires: the CPU governor is raised, a fresh sensor reading is allowed to settle, and the camera's auto-exposure arrays are given time to stabilise. After the single tick, the machine evaluates median distance and routes immediately to Active-Lo or Active-Hi. Standby also serves as the mandatory re-entry point after recovering from Watchdog, ensuring sensor data is fresh before any resolution decision is made.
 
 **Active-Lo**
 
@@ -99,7 +91,9 @@ Runs YOLOv8n INT8 inference at 640×640 resolution with a 400 ms loop pace to co
 
 **Watchdog**
 
-A failsafe override that operates independently of all other state logic and takes unconditional priority. Entered when either of two data-integrity conditions is met: the time elapsed since the last valid serial frame exceeds 2.0 seconds, or the asynchronous reader thread registers three or more consecutive dropped or corrupted packets. While active, the system runs at maximum capability — 640×640 resolution with CLAHE permanently enabled — regardless of any cached sensor values, since those values can no longer be trusted. The only exit path is a successfully validated incoming packet. On exit, the machine routes through Standby before resuming normal resolution decisions.
+A failsafe override that operates independently of all other state logic and takes unconditional priority. Entered when any of three data-integrity conditions is met: the `pigpio` daemon connection is lost, the time elapsed since the last valid ultrasonic echo exceeds 2.0 seconds, or the harvester registers three or more consecutive sonar triggers that returned no echo at all. While active, the system runs at maximum capability — 640×640 resolution with CLAHE permanently enabled — regardless of any cached sensor values, since those values can no longer be trusted. The only exit path is a successfully completed echo transaction. On exit, the machine routes through Standby before resuming normal resolution decisions.
+
+Note that the watchdog can only monitor the ultrasonic sensor and the daemon connection. The PIR and LM393 are read as digital levels — a dead or disconnected level pin reads a constant value indistinguishable from a genuinely quiet or lit room, so those two sensors cannot be health-checked. An *out-of-range* echo (an empty room) still returns a valid pulse and is treated as a healthy reading, not a failure.
 
 ---
 
@@ -109,13 +103,13 @@ Two sensors use asymmetric entry and exit thresholds to prevent state oscillatio
 
 1. The ultrasonic distance gate uses a 40 cm dead band: the system enters Active-Lo below 120 cm and exits it only above 160 cm. Within the 120–160 cm band, the current state is held regardless of new readings.
 
-2. The LDR light gate uses a 70-count dead band: CLAHE activates when the LDR value drops below 350 and deactivates only when it rises above 420. This prevents preprocessing from toggling on and off under flickering or transitional lighting conditions.
+2. The light gate's hysteresis now lives in hardware: the LM393 comparator supplies a digital dark/bright signal whose threshold is set by an onboard potentiometer, and the comparator's own built-in hysteresis prevents the output from chattering under flickering or transitional lighting. CLAHE simply follows that digital line — no software dead-band required.
 
 ---
 
 ### Ultrasonic median filter
 
-The HC-SR04 ultrasonic sensor produces measurement noise of ±5–10 cm at distances above one metre due to acoustic multipath reflections. Raw readings are never used directly in state logic. Instead, the ESP32 maintains a circular buffer of five consecutive distance samples and transmits only the median value each cycle. This eliminates spurious spikes without introducing meaningful latency at human-movement timescales.
+The HC-SR04 ultrasonic sensor produces measurement noise of ±5–10 cm at distances above one metre due to acoustic multipath reflections. Raw readings are never used directly in state logic. Instead, the Pi's sensor harvester thread maintains a circular buffer of five consecutive distance samples and feeds only the median into the shared state each cycle. This eliminates spurious spikes without introducing meaningful latency at human-movement timescales.
 
 ---
 
@@ -125,17 +119,17 @@ Low-light enhancement runs orthogonally to resolution state. When active, the pr
 
 ---
 
-## Serial Protocol
+## Sensor Acquisition (on the Pi)
 
-The ESP32 transmits a packed 7-byte binary struct at approximately 16.6 Hz:
+The harvester thread reads all three sensors directly off the GPIO header via `pigpio`, at roughly a 16.6 Hz sonar cadence:
 
-| Field | C Type | Bytes | Description |
+| Signal | Source | Pi pin | Reading |
 |---|---|---|---|
-| `pir_state` | `uint8_t` | 1 | 0 = no motion, 1 = motion detected |
-| `ldr_value` | `uint16_t` | 2 | Light level mapped 0–1023 (0 = dark) |
-| `distance_cm` | `float` | 4 | Ultrasonic distance in cm; −1.0 = out of range |
+| Motion | HC-SR501 PIR `OUT` | GPIO 17 | digital level — 1 = motion |
+| Light | LM393 comparator `DO` | GPIO 27 | digital level — active-low, LOW = dark |
+| Distance | HC-SR04 `TRIG`/`ECHO` | GPIO 23 / 24 | echo pulse width → cm; −1.0 = out of range |
 
-The ultrasonic measurement is fully interrupt-driven on the ESP32. The echo pin fires an ISR on both rising and falling edges, recording pulse duration without blocking the main loop. This means the serial transmission rate is never gated on the sonar cycle time.
+The ultrasonic measurement is interrupt-driven through `pigpio`: a 10 µs trigger pulse is emitted every ~60 ms, and a hardware-timestamped edge callback records the echo pulse width on both rising and falling edges — the same non-blocking ISR pattern the original firmware used, now running in the `pigpio` daemon's real-time thread. Because the daemon captures edges independently of the Python loop, sonar timing is never gated on inference load.
 
 ---
 
@@ -164,10 +158,10 @@ The fixed-width binary format is chosen deliberately over JSON or CSV. At the lo
 
 The Pi runs two threads pinned to separate CPU cores using `os.sched_setaffinity`:
 
-- **Core 1** — Serial harvester thread. Dedicated to blocking I/O, isolating serial reads from inference latency jitter.
+- **Core 1** — GPIO sensor harvester thread. Triggers the HC-SR04, consumes the `pigpio` echo callbacks, and polls the PIR and LM393, isolating sensor sampling from inference latency jitter.
 - **Cores 2 & 3** — Vision processing thread. OpenCV frame capture and YOLO inference share the two higher-numbered cores, leaving Core 0 free for the OS and system services.
 
-This prevents the bursty inference workload from starving the serial reader, which would cause sensor state to fall behind reality and weaken gate responsiveness.
+This prevents the bursty inference workload from starving the sensor reader, which would cause sensor state to fall behind reality and weaken gate responsiveness. (The `pigpio` daemon timestamps echo edges in its own thread regardless, so distance accuracy is preserved even during an inference spike.)
 
 ---
 
@@ -183,17 +177,18 @@ YOLOv8n (nano) exported to TFLite with full INT8 quantisation. The INT8 format w
 SAGE-Vision/
 ├── firmware/
 │   └── esp32_sensor_node/
-│       └── esp32_sensor_node.ino          # ESP32 binary sensor transmitter
+│       └── esp32_sensor_node.ino          # LEGACY — original ESP32 sensor transmitter (unused)
 ├── rpi_edge/
-│   ├── pi_edge_node.py                    # Main adaptive inference daemon
+│   ├── pi_edge_node.py                    # Main adaptive inference daemon (reads GPIO sensors)
+│   ├── yolo_tflite.py                     # Lightweight tflite-runtime YOLOv8 detector
 │   ├── requirements.txt                   # Pi Python dependencies
-│   └── yolov8n_full_integer_quant.tflite  # INT8 TFLite model weights
+│   ├── yolov8n_320_int8.tflite            # INT8 TFLite model — 320×320 (Active-Lo)
+│   └── yolov8n_640_int8.tflite            # INT8 TFLite model — 640×640 (Active-Hi / Watchdog)
 ├── host_laptop/
-│   ├── laptop_logger.py                   # UDP receiver, terminal UI, CSV writer
+│   ├── laptop_logger.py                   # UDP receiver + live terminal dashboard
 │   └── requirements.txt                   # Laptop Python dependencies
 ├── test/
 │   └── test_baseline_edge.py              # Unoptimised control-group benchmark
-├── plot_comparison.py                     # Offline 4-panel performance dashboard
 ├── .gitignore
 ├── README.md                              # This file — project overview & architecture
 ├── SETUP.md                               # Installation and execution guide
@@ -208,7 +203,7 @@ SAGE-Vision/
 | Decision | Rationale |
 |---|---|
 | UDP over TCP for telemetry | No connection-handshake latency; dropped log frames are acceptable |
-| Thread-per-concern with mutex | Isolates serial I/O jitter from inference loop timing |
+| Thread-per-concern with mutex | Isolates GPIO sensor I/O jitter from inference loop timing |
 | INT8 TFLite over FP32 PyTorch | 2–4× lower inference time on ARM Neon; no GPU required |
 | CLAHE over global brightness | Preserves local contrast for detection; global boost washes out fine edges |
 | CPU core affinity pinning | Prevents OS scheduler from migrating threads mid-inference, stabilising latency |

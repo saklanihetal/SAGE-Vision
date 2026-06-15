@@ -10,10 +10,12 @@ This document covers everything from flashing the OS to running the live pipelin
 - Raspberry Pi 4B (2 GB RAM minimum; 4 GB recommended)
 - MicroSD card (16 GB minimum, Class 10 / A1 rated)
 - USB Web Camera (UVC-compliant; plug-and-play, no drivers needed)
-- **RV-IoT Board (ESP32 Dev Module core)** with the following sensors wired up as documented in `HARDWARE_CONNECTIONS.md`:
-  - LDR (Photoresistor) — pre-wired on-board to **GPIO 39**
-  - HC-SR501 PIR Motion Sensor — **GPIO 25**
-  - HC-SR04 Ultrasonic Sensor — Trigger → **GPIO 26**, Echo → **GPIO 27** *(via 1 kΩ / 2 kΩ voltage divider to step the 5V echo line down to 3.3V)*
+- Sensors wired **directly to the Pi's 40-pin GPIO header** as documented in `HARDWARE_CONNECTIONS.md`:
+  - LM393 light comparator module — DO → **GPIO 27** (powered from 3.3V)
+  - HC-SR501 PIR Motion Sensor — OUT → **GPIO 17**
+  - HC-SR04 Ultrasonic Sensor — Trigger → **GPIO 23**, Echo → **GPIO 24** *(via 1 kΩ / 2 kΩ voltage divider to step the 5V echo line down to 3.3V)*
+
+> The sensors connect to the Pi directly — there is **no ESP32 in the live pipeline**. The original ESP32 firmware is retained under `firmware/` as legacy only; Phase 2 below is optional and not required to run the system.
 
 ### Host Laptop
 - Windows 10/11, macOS 12+, or Ubuntu 20.04+
@@ -85,7 +87,9 @@ Accept the host fingerprint prompt (type `yes` and press Enter), then enter your
 
 ---
 
-## Phase 2: ESP32 Firmware Flash (RV-IoT Board)
+## Phase 2: ESP32 Firmware Flash (RV-IoT Board) — LEGACY / OPTIONAL
+
+> **Skip this phase.** The current pipeline reads sensors directly on the Pi (Phase 3). These steps are retained only for anyone reviving the legacy ESP32-over-serial path.
 
 Do this **before** physically wiring the sensors to the board.
 
@@ -157,8 +161,18 @@ All commands in this phase are run inside your **Pi SSH session**.
 
 ```bash
 sudo apt update && sudo apt upgrade -y
-sudo apt install -y python3-pip python3-venv python3-opencv git
+sudo apt install -y python3-pip python3-venv python3-opencv git pigpio
 ```
+
+### Step 1b — Enable the pigpio daemon
+
+The Pi reads the sensors through `pigpiod`, which must be running for hardware-timestamped echo capture:
+
+```bash
+sudo systemctl enable --now pigpiod
+```
+
+Verify it is active with `systemctl status pigpiod` (look for `active (running)`).
 
 ### Step 2 — Clone the Repository
 
@@ -175,25 +189,19 @@ source .venv/bin/activate
 pip install -r rpi_edge/requirements.txt
 ```
 
-> The model weights file (`yolov8n_full_integer_quant.tflite`) is already included in the repository under `rpi_edge/`. No separate download is needed.
+> The two model weights files (`yolov8n_320_int8.tflite` and `yolov8n_640_int8.tflite`) are already included in the repository under `rpi_edge/`. No separate download is needed.
 
-> **Dependency note:** Do **not** separately install `tflite-runtime`. The `ultralytics` package manages TFLite inference internally, and installing `tflite-runtime` alongside it will cause import conflicts on the Pi's aarch64 architecture.
+> **Dependency note:** The edge node uses the lightweight **`tflite-runtime`** interpreter (installed by `requirements.txt`), **not** the full `ultralytics`/`torch` stack — those are too heavy for the Pi and are only used off-device to export the `.tflite` models. See `rpi_edge/yolo_tflite.py`.
 
-### Step 4 — Identify the ESP32 Serial Port
+### Step 4 — Verify GPIO access
 
-Plug the RV-IoT Board into one of the Pi's USB ports, then run:
+The default `pi` user is already in the `gpio` group and can talk to `pigpiod` without `sudo`. Confirm the daemon is reachable:
 
 ```bash
-dmesg | grep tty
+python3 -c "import pigpio; p=pigpio.pi(); print('pigpio connected:', p.connected)"
 ```
 
-Look for a line mentioning `ttyUSB0` or `ttyACM0`. Note the exact path — you will need it in Phase 5.
-
-If running the script later gives a serial permission error:
-```bash
-sudo usermod -aG dialout $USER
-newgrp dialout    # Apply without requiring a logout
-```
+It should print `pigpio connected: True`. If it prints `False`, start the daemon with `sudo systemctl start pigpiod` (see Phase 3, Step 1b).
 
 ---
 
@@ -264,19 +272,15 @@ Back in your **Pi SSH session**, open the edge script for editing:
 nano rpi_edge/pi_edge_node.py
 ```
 
-Find the configuration block near the top of the file and make the following two changes:
+Find the configuration block near the top of the file and set your laptop's IP address:
 
-**1. Set your laptop's IP address:**
 ```python
 LAPTOP_SERVER_IP = "192.168.1.XX"   # ← Replace with your actual laptop IP
 ```
 
-**2. Set the correct serial port for the ESP32:**
-```python
-SERIAL_INTERFACE = "/dev/ttyUSB0"   # ← Change to /dev/ttyACM0 if that is what dmesg showed
-```
-
 Save the file: `Ctrl+O` → `Enter` → `Ctrl+X`.
+
+> **GPIO pins:** if you wired the sensors to different BCM pins than the defaults, also update `PIR_PIN`, `LDR_PIN`, `TRIG_PIN`, and `ECHO_PIN` (defined at the top of `gpio_harvester_worker`) to match.
 
 ---
 
@@ -316,8 +320,8 @@ python3 rpi_edge/pi_edge_node.py
 You should see the following boot messages confirming everything initialised correctly:
 
 ```
-[SYSTEM] TFLite INT8 YOLO engine successfully initialized.
-[SYSTEM] Serial Harvester thread successfully pinned to CPU Core {1}
+[SYSTEM] TFLite INT8 YOLO engines (320 + 640) successfully initialized.
+[SYSTEM] GPIO Sensor Harvester pinned to CPU Core {1}
 [SYSTEM] Vision processing core engine pinned to CPU Cores {2, 3}
 ```
 
@@ -329,15 +333,12 @@ The laptop terminal will immediately begin displaying live telemetry rows.
 |---|---|
 | Walk in front of the camera | Pipeline switches from STANDBY to ACTIVE; inference starts |
 | Step fully out of frame and wait 5 seconds | Pipeline returns to STANDBY; CPU usage drops sharply |
-| Walk close to the camera (< 150 cm) | Inference resolution drops to 320×320; latency decreases |
-| Cover the LDR on the RV-IoT Board | CLAHE filter activates on the frame before inference |
+| Walk close to the camera (< 120 cm) | Inference resolution drops to 320×320; latency decreases |
+| Cover the LM393 light sensor | CLAHE filter activates on the frame before inference |
 
 ### Stopping the System
 
-Press `Ctrl+C` in **both** Terminal A and Terminal B. The CSV log file is written incrementally, so no data is lost on clean shutdown.
-
-Log files are saved at:
-- **Laptop:** `host_laptop/pi_optimization_logs.csv`
+Press `Ctrl+C` in **both** Terminal A and Terminal B. Telemetry is streamed live to the laptop terminal; there is no file written, so nothing needs flushing on shutdown.
 
 ---
 
@@ -351,18 +352,18 @@ Install **Bonjour Print Services for Windows** from Apple (`https://support.appl
 
 The Pi may still be booting. Wait 90 seconds from power-on and retry. If it still fails, verify your Wi-Fi credentials were entered correctly during the imaging step — the Pi will not connect to the network if the SSID or password is wrong, and you will need to re-flash.
 
-### `SerialException` / permission denied on serial port
+### `Cannot connect to pigpiod` on startup
 
+The pigpio daemon is not running. Start it (and enable it at boot):
 ```bash
-sudo usermod -aG dialout $USER
-newgrp dialout
+sudo systemctl enable --now pigpiod
 ```
 
-### ESP32 not appearing as a serial device
+### Distance readings are erratic or always out of range
 
-Swap your Micro-USB cable for one you know supports data transfer. Charge-only cables are extremely common and look identical. After swapping, unplug and replug the board.
+Check the HC-SR04 ECHO voltage divider (1 kΩ / 2 kΩ) and that TRIG/ECHO are on the expected pins (GPIO 23 / 24). A missing divider can also damage the GPIO pin. Confirm the sensor has a solid 5V supply — it reads unreliably below ~3.8V.
 
-### `ModuleNotFoundError` for `ultralytics`, `cv2`, or `psutil`
+### `ModuleNotFoundError` for `pigpio`, `cv2`, `psutil`, or `tflite_runtime`
 
 The virtual environment is not active. Run `source .venv/bin/activate` (Linux/macOS) or `.venv\Scripts\Activate.ps1` (Windows) from the repo root before running any scripts.
 
@@ -372,6 +373,11 @@ The virtual environment is not active. Run `source .venv/bin/activate` (Linux/ma
 2. Double-check `LAPTOP_SERVER_IP` in `pi_edge_node.py` — a single wrong digit will silently drop all packets.
 3. **Windows Firewall** commonly blocks inbound UDP. Either temporarily disable the firewall for testing, or add an inbound rule: *Windows Defender Firewall → Advanced Settings → Inbound Rules → New Rule → Port → UDP → 8080 → Allow the connection*.
 
-### Pipeline stays in STANDBY permanently despite motion
+### Pipeline stays in SLEEP/STANDBY permanently despite motion
 
-This is caused by the serial protocol mismatch bug described in `CODE_ISSUES_AND_FIXES.md`. The `serial_harvester_worker` in the original code uses `readline()` on a binary serial stream, which blocks indefinitely and never updates the shared PIR state. Apply the fix in that document before running the system.
+Confirm the PIR is wired to GPIO 17 and has finished its 30–60 s warm-up. Test the raw pin while the daemon runs:
+```bash
+python3 -c "import pigpio,time; p=pigpio.pi(); 
+print([p.read(17) for _ in range(5)])"
+```
+Wave your hand in front of the PIR and you should see `1`s appear. If it never reads `1`, recheck the PIR's VCC (5V) and OUT wiring and its sensitivity potentiometer.
