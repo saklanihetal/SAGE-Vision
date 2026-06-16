@@ -1,8 +1,11 @@
 pigpio>=1.78
-opencv-python-headless>=4.8.0
+opencv-python>=4.8.0
 numpy>=1.24.0
 psutil>=5.9.0
 tflite-runtime>=2.14.0
+# opencv-python (the GUI build) is required for the on-Pi demo window. For a
+# remote / no-monitor deployment, run the node with `--headless` and you may
+# instead install the lighter `opencv-python-headless` (no Qt/GUI deps).
 # pigpio drives the sensors directly off the Pi's GPIO (PIR, LM393, HC-SR04)
 # with hardware-timestamped echo edges. The pigpiod daemon must be running:
 #   sudo systemctl enable --now pigpiod   (or: sudo pigpiod)

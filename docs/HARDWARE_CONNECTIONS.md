@@ -116,10 +116,34 @@ Values above 500 cm or below 0 are clamped to -1.0 (out of range). A *completed*
 
 ---
 
-## Section 4: USB Web Camera → Raspberry Pi 4B
+## Section 4: INA260 Power Monitor (Optional — Power Telemetry)
+
+The INA260 is an I²C current/voltage/power sensor with an integrated shunt. It is **optional** — the system runs fine without it, and the telemetry `power_w` field reads `-- W` until it is wired. It exists to log whole-Pi power draw for the energy comparison between the adaptive node and the baseline.
+
+Measure **whole-Pi power** by placing the INA260 inline on the Pi's incoming **5 V supply** (so it sees the Pi's total draw). The cleanest rig is to power the Pi through its GPIO 5 V pins from a 5 V bench supply, with the INA260's `VIN+`/`VIN-` in series on the +5 V lead — and **do not also feed USB-C at the same time**.
+
+### Wiring Table
+
+| INA260 Pin | Connects to | Pi Header |
+|---|---|---|
+| VCC | 3.3V (logic) | pin 1 or pin 17 |
+| GND | Ground | any GND pin |
+| SDA | I²C data | GPIO 2 (pin 3) |
+| SCL | I²C clock | GPIO 3 (pin 5) |
+| VIN+ | 5 V supply **in** (from PSU) | (in series on the Pi's 5 V feed) |
+| VIN- | 5 V supply **out** (to the Pi) | (in series on the Pi's 5 V feed) |
+
+> Enable I²C on the Pi (`sudo raspi-config` → Interface Options → I2C). Then `read_power_w()` in `pi_edge_node.py` can read the INA260 (e.g. via `adafruit-circuitpython-ina260`) and fill the `power_w` telemetry column.
+
+---
+
+## Section 5: Display & USB Web Camera → Raspberry Pi 4B
+
+The demo GUI window opens on a **monitor attached to the Pi's HDMI port** (use the micro-HDMI port nearest the USB-C/power corner on the Pi 4B). A monitor is only needed for the GUI — running the node with `--headless` requires no display.
 
 | From | To | Cable |
 |---|---|---|
+| HDMI monitor | Raspberry Pi 4B — micro-HDMI (HDMI0) | micro-HDMI → HDMI cable |
 | USB Web Camera | Raspberry Pi 4B — any USB-A port | Camera's own USB cable |
 
 Any UVC-compliant camera works without driver installation. Plug it in and it appears as `/dev/video0`. Verify with:
@@ -139,8 +163,10 @@ ls /dev/video*
 | GPIO 27 | 13 | Light digital input | LM393 DO | Direct connection (LM393 powered at 3.3V) |
 | GPIO 23 | 16 | Ultrasonic trigger output | HC-SR04 TRIG | Direct connection |
 | GPIO 24 | 18 | Ultrasonic echo input | HC-SR04 ECHO (via divider) | Must use 1kΩ/2kΩ voltage divider |
+| GPIO 2 | 3 | I²C data (SDA) | INA260 SDA | Optional power monitor |
+| GPIO 3 | 5 | I²C clock (SCL) | INA260 SCL | Optional power monitor |
 
-> These pins are defined as constants at the top of `gpio_harvester_worker` in `rpi_edge/pi_edge_node.py` (`PIR_PIN`, `LDR_PIN`, `TRIG_PIN`, `ECHO_PIN`). If you wire to different pins, change them there to match.
+> The sensor pins are defined as constants at the top of `gpio_harvester_worker` in `rpi_edge/pi_edge_node.py` (`PIR_PIN`, `LDR_PIN`, `TRIG_PIN`, `ECHO_PIN`). If you wire to different pins, change them there to match.
 
 ### Power Rails
 
@@ -152,11 +178,12 @@ ls /dev/video*
 
 > The PIR and the Ultrasonic sensor require **5V**; the LM393 light module is powered from **3.3V** so its digital output is GPIO-safe. Do not power the HC-SR501 or HC-SR04 from 3.3V — the PIR will malfunction and the HC-SR04 produces unreliable readings below ~3.8V supply.
 
-### USB Connection on Raspberry Pi 4B
+### USB / Display Connections on Raspberry Pi 4B
 
-| Pi USB Port | Connected Device |
+| Pi Port | Connected Device |
 |---|---|
 | Any USB-A | USB Web Camera |
+| micro-HDMI (HDMI0) | Monitor for the demo GUI *(omit if running `--headless`)* |
 
 ---
 
@@ -174,6 +201,8 @@ Before powering the system on, verify:
 - [ ] Voltage divider GND leg connected to GND
 - [ ] All GND connections share the same ground rail (sensor grounds + Pi GND)
 - [ ] USB camera plugged into a Pi USB port
+- [ ] HDMI monitor connected (for the demo GUI; skip if running `--headless`)
+- [ ] *(Optional)* INA260 VCC→3.3V, SDA→GPIO 2, SCL→GPIO 3, and VIN±in series on the Pi's 5 V feed
 - [ ] No bare wire ends that could short against the header or the board
 
 ---

@@ -15,7 +15,7 @@ SAGE-Vision takes a different approach: **let the physical environment decide ho
 
 ## System Architecture
 
-The pipeline is split across two physical nodes. Sensors wire directly to the Raspberry Pi's GPIO header; the Pi reports to the laptop over UDP:
+The system is **self-contained on the Raspberry Pi**. Sensors wire directly to its GPIO header; results are shown on a local HDMI GUI and logged to the Pi's own terminal — no second board and no network in the live path:
 
 ```
    Sensors ── wired to Raspberry Pi GPIO header
@@ -24,44 +24,42 @@ The pipeline is split across two physical nodes. Sensors wire directly to the Ra
    │  LM393 light     DO  ── GPIO 27        │
    │  HC-SR04  TRIG ── GPIO 23              │
    │           ECHO ── GPIO 24 (divider)    │
+   │  INA260 power    SDA/SCL ── I2C (opt.) │
    └────────────────────┬───────────────────┘
                         ▼
-┌─────────────────────────┐
-│   Raspberry Pi 4B       │
-│                         │
-│  Thread 1 (Core 1)      │
-│   GPIO sensor harvester │
-│   ── pigpio: PIR / LM393│
-│      + HC-SR04 echo ISR │
-│   ── median-filters dist│
-│   ── updates shared     │
-│      state (mutex)      │
-│                         │
-│  Thread 2 (Cores 2+3)   │
-│   Adaptive vision loop  │
-│   ── PIR standby gate   │
-│   ── LM393 CLAHE gate   │
-│   ── Ultrasonic res gate│
-│   ── YOLOv8 INT8 TFLite │
-│   ── packs 40-byte UDP  │
-└────────────┬────────────┘
-             │  40-byte packed binary UDP payload
-             │  to port 8080
-             ▼
-┌─────────────────────────┐
-│   Host Laptop           │
-│                         │
-│  laptop_logger.py       │
-│   ── decodes payload    │
-│   ── live terminal UI   │
-└─────────────────────────┘
+┌──────────────────────────────┐
+│   Raspberry Pi 4B            │
+│                              │
+│  Thread 1 (Core 1)           │
+│   GPIO sensor harvester      │
+│   ── pigpio: PIR / LM393     │
+│      + HC-SR04 echo ISR      │
+│   ── median-filters distance │
+│   ── updates shared state    │
+│      (mutex)                 │
+│                              │
+│  Thread 2 (Cores 2+3)        │
+│   Adaptive vision loop       │
+│   ── PIR standby gate        │
+│   ── LM393 CLAHE gate        │
+│   ── Ultrasonic res gate     │
+│   ── YOLOv8 INT8 TFLite      │
+│   ── telemetry record        │
+│      ──► terminal sink       │
+│      ──► (cloud sink: TODO)  │
+│   ── on-Pi GUI (boxes + HUD) │
+└───────┬───────────────┬──────┘
+        ▼               ▼
+   HDMI monitor     Pi terminal
+   (live video +    (telemetry log,
+    blue boxes)      every state)
 ```
 
 ### Why This Topology
 
-The Raspberry Pi reads the sensors directly off its GPIO header through the `pigpio` daemon, which captures the HC-SR04 echo edges with hardware timestamps in its own real-time thread — the equivalent of a microcontroller ISR, but without a second board or a serial link to keep in sync. Sensor sampling lives on a thread pinned to Core 1; all inference and adaptive decision-making run on a separate thread pinned to Cores 2 & 3. The laptop handles only logging and visualisation, keeping its processing entirely offline from the inference loop so it adds zero latency.
+The Raspberry Pi reads the sensors directly off its GPIO header through the `pigpio` daemon, which captures the HC-SR04 echo edges with hardware timestamps in its own real-time thread — the equivalent of a microcontroller ISR, but without a second board or a serial link to keep in sync. Sensor sampling lives on a thread pinned to Core 1; all inference, adaptive decision-making, and the demo GUI run on a separate thread pinned to Cores 2 & 3. Telemetry is printed to the Pi's own terminal, so the whole system runs **fully offline** (an optional cloud sink and an INA260 power reading are stubbed in `pi_edge_node.py` for later).
 
-The two on-Pi threads communicate only through a mutex-guarded latest-value snapshot, so a slow inference frame can never starve the sensor reader — and removing the ESP32 also removes a whole class of serial-framing and buffer-overflow failure modes.
+The two on-Pi threads communicate only through a mutex-guarded latest-value snapshot, so a slow inference frame can never starve the sensor reader — and reading sensors directly on the Pi removes the ESP32, the serial link, and the whole class of serial-framing and buffer-overflow failure modes that came with them.
 
 ---
 
@@ -133,24 +131,40 @@ The ultrasonic measurement is interrupt-driven through `pigpio`: a 10 µs trigge
 
 ---
 
-## UDP Telemetry Payload
+## Telemetry & the On-Pi Demo GUI
 
-The Raspberry Pi packs all telemetry into a fixed 40-byte little-endian struct before each UDP transmission:
+Each loop the vision thread assembles **one telemetry record** (a dict) and fans it out to a set of sinks:
 
-| Field | Format | Bytes | Description |
-|---|---|---|---|
-| `mode` | `uint8` | 1 | 0 = standby, 1 = active inference |
-| `cpu_pct` | `float` | 4 | CPU utilisation % |
-| `cpu_temp` | `float` | 4 | Core temperature °C |
-| `distance` | `float` | 4 | Last sensor distance reading (cm) |
-| `img_res` | `uint16` | 2 | Inference resolution (320 or 640) |
-| `latency_ms` | `float` | 4 | Per-frame inference duration (ms) |
-| `det_count` | `uint8` | 1 | Number of active detections (max 4) |
-| `classes[4]` | `4× uint8` | 4 | COCO class IDs (255 = empty slot) |
-| `confs[4]` | `4× float` | 16 | Detection confidence scores (0.0–1.0) |
-| **Total** | | **40** | |
+| Field | Description |
+|---|---|
+| `state` | FSM state (`SLEEP`/`STANDBY`/`ACTIVE-LO`/`ACTIVE-HI`/`WATCHDOG`) |
+| `model_res` | Inference resolution / model used: `320`, `640`, or `---` when idle |
+| `latency_ms` | Per-frame inference duration |
+| `cpu_pct`, `cpu_temp_c` | CPU utilisation % and core temperature °C |
+| `power_w` | Whole-Pi power draw (INA260 over I2C — `-- W` until the sensor is wired) |
+| `distance_cm` | Median ultrasonic distance |
+| `detections` | List of `(label, confidence%)` — **all** detections, not capped |
 
-The fixed-width binary format is chosen deliberately over JSON or CSV. At the logging frequency the system runs, a JSON packet would be 3–5× larger and require string parsing on every frame. The binary struct unpacks in a single `struct.unpack` call with zero string allocation.
+The only active sink today is the **terminal sink** (`_terminal_sink`), which prints one line per loop to the Pi's own console — the system runs fully offline. Two sinks are stubbed for later, both designed to be non-blocking so they never stall the FSM:
+- `read_power_w()` — read the INA260 and fill the `power_w` column.
+- `_cloud_sink()` — push records to a cloud platform (one line to enable in `emit_telemetry`).
+
+Sample terminal line:
+```
+[14:22:07] ACTIVE-LO | model 320 | lat   28.4ms | cpu 47.0% | temp 58.1C | pwr  -- W | dist   95.3cm | dets: Student/Person(94.2%)
+```
+
+### On-Pi GUI (demo)
+
+For demos, the node opens a local window on the Pi's HDMI monitor (run with the default; pass `--headless` to disable it for remote deployment). It shows the live camera feed with **blue detection boxes** and a solid HUD header bar above the (unobstructed) video:
+
+```
+SAGE-Vision   ACTIVE-LO            ← state name colour-coded (green active / grey idle / red watchdog)
+Model 320 | Objects: 3 | 28 ms | 31 FPS
+cpu 47% | 58C | -- W | dist 95 cm
+```
+
+Boxes are pure blue `(255,0,0)`; each label (`Class conf%`) is blue with a thin black outline for legibility. During SLEEP/STANDBY the video area shows a "SYSTEM IDLE" placeholder so the window stays responsive. Keys: **`q`** quits the node cleanly, **`f`** toggles fullscreen. The GUI render runs inside the vision thread (Cores 2 & 3) and adds negligible cost — far less than encoding and streaming frames over a network would.
 
 ---
 
@@ -184,17 +198,21 @@ SAGE-Vision/
 │   ├── requirements.txt                   # Pi Python dependencies
 │   ├── yolov8n_320_int8.tflite            # INT8 TFLite model — 320×320 (Active-Lo)
 │   └── yolov8n_640_int8.tflite            # INT8 TFLite model — 640×640 (Active-Hi / Watchdog)
-├── host_laptop/
-│   ├── laptop_logger.py                   # UDP receiver + live terminal dashboard
-│   └── requirements.txt                   # Laptop Python dependencies
 ├── test/
-│   └── test_baseline_edge.py              # Unoptimised control-group benchmark
+│   └── test_baseline_edge.py              # Unoptimised control benchmark (terminal + GUI)
+├── docs/
+│   ├── SETUP.md                           # Installation and execution guide
+│   ├── TESTING.md                         # Benchmarking and validation procedure
+│   └── HARDWARE_CONNECTIONS.md            # Wiring tables for all sensors
 ├── .gitignore
-├── README.md                              # This file — project overview & architecture
-├── SETUP.md                               # Installation and execution guide
-├── TESTING.md                             # Benchmarking and validation procedure
-└── HARDWARE_CONNECTIONS.md                # Wiring tables for all sensors
+└── README.md                              # This file — project overview & architecture
 ```
+
+### Documentation
+
+- [docs/SETUP.md](docs/SETUP.md) — installation and execution (HDMI or VNC display).
+- [docs/HARDWARE_CONNECTIONS.md](docs/HARDWARE_CONNECTIONS.md) — full wiring for every sensor.
+- [docs/TESTING.md](docs/TESTING.md) — benchmarking the adaptive node against the baseline.
 
 ---
 
@@ -202,7 +220,9 @@ SAGE-Vision/
 
 | Decision | Rationale |
 |---|---|
-| UDP over TCP for telemetry | No connection-handshake latency; dropped log frames are acceptable |
+| On-Pi terminal telemetry + local GUI | Fully offline; no network in the live path, no frame-encoding overhead, no second machine |
+| Telemetry record + pluggable sinks | Terminal now; cloud/power sinks drop in later without touching the FSM |
+| Direct GPIO sensors via `pigpio` | Removes the ESP32 and serial link; hardware-timestamped echo edges keep distance accurate |
 | Thread-per-concern with mutex | Isolates GPIO sensor I/O jitter from inference loop timing |
 | INT8 TFLite over FP32 PyTorch | 2–4× lower inference time on ARM Neon; no GPU required |
 | CLAHE over global brightness | Preserves local contrast for detection; global boost washes out fine edges |

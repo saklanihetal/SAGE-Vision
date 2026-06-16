@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import argparse
 import threading
 import cv2
 import numpy as np
@@ -142,6 +143,79 @@ def _terminal_sink(record):
         f"dist {record['distance_cm']:6.1f}cm | dets: {det_str}",
         flush=True,
     )
+
+
+# =========================================================================
+# ON-PI DEMO GUI (optional — disabled with --headless for remote deployment)
+# =========================================================================
+ENABLE_GUI = True          # overridden by the --headless CLI flag in __main__
+shutdown_event = threading.Event()
+
+WINDOW_NAME = "SAGE-Vision"
+HEADER_H = 72              # solid HUD bar stacked ABOVE the unobstructed video
+BOX_COLOR = (255, 0, 0)    # pure blue (BGR) detection boxes
+STATE_COLORS = {           # HUD state-name colour coding
+    STATE_SLEEP:     (170, 170, 170),
+    STATE_STANDBY:   (170, 170, 170),
+    STATE_ACTIVE_LO: (0, 200, 0),
+    STATE_ACTIVE_HI: (0, 200, 0),
+    STATE_WATCHDOG:  (0, 0, 255),
+}
+_fullscreen = False
+
+
+def _text(img, s, org, color, scale=0.5, thick=1, outline=False):
+    """Draw text, optionally with a black outline for legibility on any scene."""
+    if outline:
+        cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), thick + 2, cv2.LINE_AA)
+    cv2.putText(img, s, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+
+
+def _compose_gui(video, record, boxes, detection_pairs):
+    """Draw blue boxes on the video and stack a solid HUD header above it."""
+    # Blue detection boxes + plain blue labels (black-outlined for legibility)
+    for (x1, y1, x2, y2), (name, conf) in zip(boxes, detection_pairs):
+        cv2.rectangle(video, (x1, y1), (x2, y2), BOX_COLOR, 2)
+        _text(video, f"{name} {conf:.0f}%", (x1, max(y1 - 6, 12)), BOX_COLOR, 0.5, 1, outline=True)
+
+    header = np.full((HEADER_H, video.shape[1], 3), (30, 30, 30), dtype=np.uint8)
+    state = record["state"]
+    _text(header, f"SAGE-Vision   {state}", (8, 20), STATE_COLORS.get(state, (255, 255, 255)), 0.6, 1)
+
+    res = record["model_res"]; res_str = str(res) if res else "---"
+    lat = record["latency_ms"]; lat_str = f"{lat:.0f} ms" if lat is not None else "---"
+    fps = record.get("fps"); fps_str = f"{fps:.0f} FPS" if fps else "-- FPS"
+    _text(header, f"Model {res_str} | Objects: {len(detection_pairs)} | {lat_str} | {fps_str}",
+          (8, 43), (255, 255, 255), 0.5, 1)
+
+    pwr = record["power_w"]; pwr_str = f"{pwr:.2f} W" if pwr is not None else "-- W"
+    dist = record.get("distance_cm")
+    dist_str = f"{dist:.0f} cm" if dist is not None else "n/a"
+    _text(header, f"cpu {record['cpu_pct']:.0f}% | {record['cpu_temp_c']:.0f}C | {pwr_str} | dist {dist_str}",
+          (8, 64), (255, 255, 255), 0.5, 1)
+
+    return np.vstack([header, video])
+
+
+def _idle_frame():
+    """Black placeholder shown during SLEEP/STANDBY (no inference)."""
+    f = np.zeros((480, 640, 3), dtype=np.uint8)
+    _text(f, "SYSTEM IDLE", (205, 250), (170, 170, 170), 1.0, 2, outline=True)
+    return f
+
+
+def show_gui(video, record, boxes, detection_pairs):
+    """Render one GUI frame and pump keys. Returns 'quit' if the user pressed q."""
+    global _fullscreen
+    cv2.imshow(WINDOW_NAME, _compose_gui(video, record, boxes, detection_pairs))
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord('q'):
+        return "quit"
+    if key == ord('f'):
+        _fullscreen = not _fullscreen
+        cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
+                              cv2.WINDOW_FULLSCREEN if _fullscreen else cv2.WINDOW_NORMAL)
+    return None
 
 
 # =========================================================================
@@ -290,14 +364,24 @@ def adaptive_vision_streamer():
     camera_feed.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     camera_feed.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
 
+    if ENABLE_GUI:
+        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(WINDOW_NAME, 640, HEADER_H + 480)
+
     # Internal FSM state tracking variables
     current_state = STATE_SLEEP
     standby_ticks_start = 0.0
     clahe_active = False
-    
+    prev_loop_t = time.time()   # for live FPS estimation
+
     print("[INIT] Launching 5-State Finite State Machine Kernel Loop...", flush=True)
-    
+
     while True:
+        # Live loop-rate (effective display FPS, includes pacing/sleep)
+        loop_t = time.time()
+        fps = 1.0 / (loop_t - prev_loop_t) if loop_t > prev_loop_t else 0.0
+        prev_loop_t = loop_t
+
         # -----------------------------------------------------------------
         # STEP A: WATCHDOG FAILSAFE OVERRIDE RULE EVALUATION (ENHANCED)
         # -----------------------------------------------------------------
@@ -387,7 +471,7 @@ def adaptive_vision_streamer():
         # Handle non-inference states (SLEEP & STANDBY) to maximize power savings
         if current_state in [STATE_SLEEP, STATE_STANDBY]:
             cpu_pct, cpu_c = get_pi_hardware_metrics()
-            emit_telemetry({
+            idle_record = {
                 "ts": time.strftime("%H:%M:%S"),
                 "state": current_state,
                 "model_res": None,        # no inference in this state
@@ -396,8 +480,13 @@ def adaptive_vision_streamer():
                 "cpu_temp_c": cpu_c,
                 "power_w": read_power_w(),
                 "distance_cm": distance,
+                "fps": fps,
                 "detections": [],
-            })
+            }
+            emit_telemetry(idle_record)
+
+            if ENABLE_GUI and show_gui(_idle_frame(), idle_record, [], []) == "quit":
+                break
 
             # Pacing adjustment: deep sleep if sleeping, rapid loop if warming up
             time.sleep(1.0 if current_state == STATE_SLEEP else 0.05)
@@ -433,13 +522,13 @@ def adaptive_vision_streamer():
 
         # Run model inference and track math execution performance times
         start_inference = time.time()
-        detected_classes, detected_confidences = detector(processed_frame)
+        detected_classes, detected_confidences, detected_boxes = detector(processed_frame)
         inference_duration_ms = (time.time() - start_inference) * 1000.0
 
         detection_pairs = build_detection_pairs(detected_classes, detected_confidences)
         cpu_pct, cpu_c = get_pi_hardware_metrics()
 
-        emit_telemetry({
+        active_record = {
             "ts": time.strftime("%H:%M:%S"),
             "state": current_state,
             "model_res": img_inference_size,   # 320 (ACTIVE-LO) or 640 (ACTIVE-HI / WATCHDOG)
@@ -448,19 +537,40 @@ def adaptive_vision_streamer():
             "cpu_temp_c": cpu_c,
             "power_w": read_power_w(),
             "distance_cm": distance,
+            "fps": fps,
             "detections": detection_pairs,
-        })
+        }
+        emit_telemetry(active_record)
+
+        if ENABLE_GUI and show_gui(processed_frame, active_record, detected_boxes, detection_pairs) == "quit":
+            break
 
         time.sleep(loop_pacing_rate)
 
+    # GUI quit ('q') -> tidy up and signal the main thread to exit
+    camera_feed.release()
+    if ENABLE_GUI:
+        cv2.destroyAllWindows()
+    shutdown_event.set()
+
 
 if __name__ == "__main__":
-    print("[INIT] Launching 5-State Adaptive Video Edge Node Framework...", flush=True)
+    parser = argparse.ArgumentParser(description="SAGE-Vision adaptive edge inference node")
+    parser.add_argument("--headless", action="store_true",
+                        help="run without the on-Pi GUI window (remote / no-monitor deployment)")
+    args = parser.parse_args()
+    ENABLE_GUI = not args.headless
+
+    print(f"[INIT] Launching 5-State Adaptive Video Edge Node Framework "
+          f"(GUI {'enabled' if ENABLE_GUI else 'disabled'})...", flush=True)
     harvester_thread = threading.Thread(target=gpio_harvester_worker, daemon=True)
     vision_thread = threading.Thread(target=adaptive_vision_streamer, daemon=True)
-    
+
     harvester_thread.start()
     vision_thread.start()
-    
-    while True:
-        time.sleep(1)
+
+    try:
+        shutdown_event.wait()
+    except KeyboardInterrupt:
+        pass
+    print("\n[SHUTDOWN] SAGE-Vision edge node stopped.", flush=True)

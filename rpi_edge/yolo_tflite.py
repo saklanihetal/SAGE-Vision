@@ -19,8 +19,9 @@ from tflite_runtime.interpreter import Interpreter
 class YoloTFLite:
     """Single fixed-resolution YOLOv8 INT8 TFLite detector.
 
-    Call the instance with a BGR frame; returns (class_ids, confidences) as
-    plain Python lists, matching the data the UDP packet builder expects.
+    Call the instance with a BGR frame; returns (class_ids, confidences, boxes)
+    as plain Python lists, where boxes are [x1, y1, x2, y2] in the ORIGINAL
+    frame's pixel coordinates (letterbox padding/scale already undone).
     """
 
     def __init__(self, model_path, conf_thres=0.35, iou_thres=0.45):
@@ -48,6 +49,12 @@ class YoloTFLite:
         return canvas
 
     def __call__(self, frame_bgr):
+        # Original frame size + letterbox scale, used to map boxes back later.
+        # _letterbox places the resized image at the canvas top-left (pad on
+        # right/bottom only), so original_coord = canvas_coord / r.
+        h0, w0 = frame_bgr.shape[:2]
+        r = min(self.in_h / h0, self.in_w / w0)
+
         # Preprocess: letterbox -> RGB -> 0..1 -> quantize to model input dtype
         img = cv2.cvtColor(self._letterbox(frame_bgr), cv2.COLOR_BGR2RGB)
         x = img.astype(np.float32) / 255.0
@@ -76,19 +83,27 @@ class YoloTFLite:
         keep = conf > self.conf_thres
         boxes_xywh, cls, conf = boxes_xywh[keep], cls[keep], conf[keep]
         if len(conf) == 0:
-            return [], []
+            return [], [], []
 
-        # Convert normalized xywh (center) -> pixel xywh (top-left) for NMS
-        xywh = boxes_xywh.copy()
-        xywh[:, 0] *= self.in_w
-        xywh[:, 1] *= self.in_h
-        xywh[:, 2] *= self.in_w
-        xywh[:, 3] *= self.in_h
-        x1 = xywh[:, 0] - xywh[:, 2] / 2
-        y1 = xywh[:, 1] - xywh[:, 3] / 2
-        rects = np.stack([x1, y1, xywh[:, 2], xywh[:, 3]], axis=1).tolist()
+        # Normalized xywh (center) -> canvas pixel coords (the model-input space)
+        cx = boxes_xywh[:, 0] * self.in_w
+        cy = boxes_xywh[:, 1] * self.in_h
+        bw = boxes_xywh[:, 2] * self.in_w
+        bh = boxes_xywh[:, 3] * self.in_h
+        x1 = cx - bw / 2
+        y1 = cy - bh / 2
+        rects = np.stack([x1, y1, bw, bh], axis=1).tolist()
 
         idxs = cv2.dnn.NMSBoxes(rects, conf.tolist(), self.conf_thres, self.iou_thres)
         idxs = np.array(idxs).flatten() if len(idxs) else np.array([], dtype=int)
+        if len(idxs) == 0:
+            return [], [], []
 
-        return cls[idxs].tolist(), conf[idxs].tolist()
+        # Map surviving boxes from canvas coords back to the original frame (/r)
+        x2 = cx + bw / 2
+        y2 = cy + bh / 2
+        boxes_xyxy = np.stack([x1, y1, x2, y2], axis=1)[idxs] / r
+        boxes_xyxy[:, [0, 2]] = boxes_xyxy[:, [0, 2]].clip(0, w0)
+        boxes_xyxy[:, [1, 3]] = boxes_xyxy[:, [1, 3]].clip(0, h0)
+
+        return cls[idxs].tolist(), conf[idxs].tolist(), boxes_xyxy.astype(int).tolist()

@@ -10,17 +10,14 @@ This document covers everything from flashing the OS to running the live pipelin
 - Raspberry Pi 4B (2 GB RAM minimum; 4 GB recommended)
 - MicroSD card (16 GB minimum, Class 10 / A1 rated)
 - USB Web Camera (UVC-compliant; plug-and-play, no drivers needed)
+- A **display for the demo GUI** — either a physical **HDMI monitor** (+ keyboard) or remote **VNC** from your computer (see Phase 5). *(Not needed if you run with `--headless`.)*
 - Sensors wired **directly to the Pi's 40-pin GPIO header** as documented in `HARDWARE_CONNECTIONS.md`:
   - LM393 light comparator module — DO → **GPIO 27** (powered from 3.3V)
   - HC-SR501 PIR Motion Sensor — OUT → **GPIO 17**
   - HC-SR04 Ultrasonic Sensor — Trigger → **GPIO 23**, Echo → **GPIO 24** *(via 1 kΩ / 2 kΩ voltage divider to step the 5V echo line down to 3.3V)*
+  - *(Optional, for power telemetry)* INA260 power monitor on the Pi's 5V rail over I2C
 
-> The sensors connect to the Pi directly — there is **no ESP32 in the live pipeline**. The original ESP32 firmware is retained under `firmware/` as legacy only; Phase 2 below is optional and not required to run the system.
-
-### Host Laptop
-- Windows 10/11, macOS 12+, or Ubuntu 20.04+
-- Python 3.9 or newer
-- Connected to the **same local Wi-Fi or Ethernet subnet** as the Raspberry Pi
+> The sensors connect to the Pi directly — there is **no ESP32 in the live pipeline**. The original ESP32 firmware is retained under `firmware/` as legacy only; Phase 2 below is optional and not required to run the system. The system runs **fully offline on the Pi alone** — no second machine is involved in live operation.
 
 ---
 
@@ -43,7 +40,9 @@ Download and install the **Raspberry Pi Imager** for your operating system:
 1. Insert your MicroSD card into your laptop.
 2. Open Raspberry Pi Imager.
 3. Click **Choose Device** → select **Raspberry Pi 4**.
-4. Click **Choose OS** → select **Raspberry Pi OS (64-bit) Lite** *(the server variant with no desktop environment — strongly recommended to reduce CPU and memory overhead)*.
+4. Click **Choose OS** → choose based on how you'll view the demo GUI:
+   - **Raspberry Pi OS (64-bit) with Desktop** — required if you want the on-Pi GUI window over **HDMI or VNC** (the window needs a display server).
+   - **Raspberry Pi OS (64-bit) Lite** — no desktop; lighter (less CPU/RAM overhead). Use this only for **`--headless`** operation (terminal telemetry, no GUI).
 5. Click **Choose Storage** → select your MicroSD card.
 6. Click **Next**, then **Edit Settings** when prompted.
 
@@ -205,116 +204,65 @@ It should print `pigpio connected: True`. If it prints `False`, start the daemon
 
 ---
 
-## Phase 4: Host Laptop Software Setup
+## Phase 4: Configuration (optional)
 
-Open a **new terminal window on your laptop** (separate from the SSH session).
+The system needs **no network or laptop configuration** — telemetry prints to the Pi's own terminal and the demo GUI opens on the Pi's HDMI monitor.
 
-### Step 1 — Clone the Repository
-
-**macOS / Linux / Ubuntu:**
-```bash
-git clone https://github.com/HR-coding/SAGE-Vision.git
-cd SAGE-Vision
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r host_laptop/requirements.txt
-```
-
-**Windows (PowerShell):**
-```powershell
-git clone https://github.com/HR-coding/SAGE-Vision.git
-cd SAGE-Vision
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-pip install -r host_laptop\requirements.txt
-```
-
-> **Windows execution policy note:** If PowerShell blocks the activation script, run this first:
-> ```powershell
-> Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
-> ```
-
-> **`host_laptop/requirements.txt` note:** This file should contain `pandas`, `matplotlib`, and `numpy`. If it is missing from the repository, install manually:
-> ```bash
-> pip install pandas matplotlib numpy
-> ```
-
-### Step 2 — Find Your Laptop's Local IP Address
-
-You need this so the Pi knows where to send UDP packets.
-
-**Windows:**
-```cmd
-ipconfig
-```
-Look for **IPv4 Address** under your active adapter (Wi-Fi or Ethernet). It will look like `192.168.x.x` or `10.0.x.x`.
-
-**macOS:**
-```bash
-ipconfig getifaddr en0       # Wi-Fi
-ipconfig getifaddr en1       # Ethernet (if Wi-Fi is en0)
-```
-
-**Linux / Ubuntu:**
-```bash
-ip route get 1 | awk '{print $7; exit}'
-```
-
-Write this IP address down — you will enter it in the next phase.
-
----
-
-## Phase 5: Network & Script Configuration
-
-Back in your **Pi SSH session**, open the edge script for editing:
+The only thing you may need to change is the GPIO pin map, and only if you wired the sensors differently from the defaults. In your Pi session:
 
 ```bash
 nano rpi_edge/pi_edge_node.py
 ```
 
-Find the configuration block near the top of the file and set your laptop's IP address:
-
+The pin constants are at the top of `gpio_harvester_worker`:
 ```python
-LAPTOP_SERVER_IP = "192.168.1.XX"   # ← Replace with your actual laptop IP
+PIR_PIN  = 17   # PIR OUT
+LDR_PIN  = 27   # LM393 DO (active-low)
+TRIG_PIN = 23   # HC-SR04 TRIG
+ECHO_PIN = 24   # HC-SR04 ECHO (via divider)
 ```
-
-Save the file: `Ctrl+O` → `Enter` → `Ctrl+X`.
-
-> **GPIO pins:** if you wired the sensors to different BCM pins than the defaults, also update `PIR_PIN`, `LDR_PIN`, `TRIG_PIN`, and `ECHO_PIN` (defined at the top of `gpio_harvester_worker`) to match.
+Edit them to match your wiring, then save: `Ctrl+O` → `Enter` → `Ctrl+X`.
 
 ---
 
-## Phase 6: Running the System
+## Phase 5: Running the System
 
-Open your workspace with **two terminal windows** side by side.
+The node runs on the Pi alone. The demo GUI window needs a desktop display — view it on a **physical HDMI monitor** or remotely over **VNC** (pick one below). With no display at all, run `--headless` for terminal-only telemetry.
 
-### Terminal A — Host Laptop Logger (start this first)
+### Option A — HDMI monitor (simplest)
 
-The laptop must be listening before the Pi starts transmitting, or the first few packets will be dropped.
+Connect a monitor to the Pi's micro-HDMI port and a keyboard, log in to the desktop, open a terminal, and run the node (Option C commands). The `SAGE-Vision` window appears on the monitor.
 
-**macOS / Linux / Ubuntu:**
+### Option B — VNC (remote desktop, no monitor)
+
+Run the GUI on your own computer's screen by viewing the Pi's desktop over VNC. Requires **Raspberry Pi OS with Desktop** (see Phase 1).
+
+1. **Enable the VNC server on the Pi** (over SSH):
+   ```bash
+   sudo raspi-config
+   # Interface Options → VNC → Enable, then finish.
+   ```
+2. **Set a virtual display resolution** so VNC has a desktop to draw even with no monitor attached:
+   ```bash
+   sudo raspi-config
+   # Display Options → VNC Resolution → e.g. 1280x720 → finish → reboot.
+   ```
+3. **Install a VNC viewer on your computer** — [RealVNC Viewer](https://www.realvnc.com/en/connect/download/viewer/) (Windows/macOS/Linux), free.
+4. **Connect** the viewer to `raspberrypi.local` (or the Pi's IP) and log in with your Pi username/password. The Pi desktop appears in the viewer.
+5. Open a **terminal inside the VNC desktop** and run the node (Option C commands). The `SAGE-Vision` window appears in the VNC session — keys `q`/`f` work the same.
+
+> Do **not** launch the GUI from a plain `ssh` shell — it has no display and `imshow` will error. Use the terminal *inside* the HDMI or VNC desktop, or run `--headless`.
+
+### Option C — run the node
+
+From a terminal on the HDMI desktop or the VNC desktop (or any SSH shell if using `--headless`):
+
 ```bash
 cd SAGE-Vision
 source .venv/bin/activate
-python3 host_laptop/laptop_logger.py
-```
-
-**Windows:**
-```powershell
-cd SAGE-Vision
-.venv\Scripts\Activate.ps1
-python host_laptop\laptop_logger.py
-```
-
-You will see a dashboard header printed to the terminal. The logger will now wait silently for incoming packets.
-
-### Terminal B — Pi Edge Node (SSH)
-
-```bash
-ssh pi@raspberrypi.local
-cd SAGE-Vision
-source .venv/bin/activate
-python3 rpi_edge/pi_edge_node.py
+python3 rpi_edge/pi_edge_node.py             # demo GUI (HDMI or VNC desktop)
+# or, with no display at all:
+python3 rpi_edge/pi_edge_node.py --headless  # terminal telemetry only
 ```
 
 You should see the following boot messages confirming everything initialised correctly:
@@ -323,22 +271,23 @@ You should see the following boot messages confirming everything initialised cor
 [SYSTEM] TFLite INT8 YOLO engines (320 + 640) successfully initialized.
 [SYSTEM] GPIO Sensor Harvester pinned to CPU Core {1}
 [SYSTEM] Vision processing core engine pinned to CPU Cores {2, 3}
+[INIT] Launching 5-State Adaptive Video Edge Node Framework (GUI enabled)...
 ```
 
-The laptop terminal will immediately begin displaying live telemetry rows.
+Telemetry begins printing to the terminal immediately — one line per loop, in every state. With the GUI enabled, the `SAGE-Vision` window shows the live feed with blue detection boxes and a HUD header bar. **Press `q` to quit cleanly, `f` to toggle fullscreen.**
 
 ### What to Expect During Live Operation
 
 | You do this | Expected system behaviour |
 |---|---|
 | Walk in front of the camera | Pipeline switches from STANDBY to ACTIVE; inference starts |
-| Step fully out of frame and wait 5 seconds | Pipeline returns to STANDBY; CPU usage drops sharply |
-| Walk close to the camera (< 120 cm) | Inference resolution drops to 320×320; latency decreases |
+| Step fully out of frame and wait 5 seconds | Pipeline returns to SLEEP; CPU usage drops sharply; GUI shows "SYSTEM IDLE" |
+| Walk close to the camera (< 120 cm) | HUD shows `Model 320`; inference resolution drops to 320×320; latency decreases |
 | Cover the LM393 light sensor | CLAHE filter activates on the frame before inference |
 
 ### Stopping the System
 
-Press `Ctrl+C` in **both** Terminal A and Terminal B. Telemetry is streamed live to the laptop terminal; there is no file written, so nothing needs flushing on shutdown.
+With the GUI: press **`q`** in the window. Otherwise (or in `--headless`): press **`Ctrl+C`** in the Pi terminal. Telemetry is printed live to the terminal; there is no file written, so nothing needs flushing on shutdown.
 
 ---
 
@@ -367,11 +316,9 @@ Check the HC-SR04 ECHO voltage divider (1 kΩ / 2 kΩ) and that TRIG/ECHO are on
 
 The virtual environment is not active. Run `source .venv/bin/activate` (Linux/macOS) or `.venv\Scripts\Activate.ps1` (Windows) from the repo root before running any scripts.
 
-### Laptop receives no UDP packets
+### GUI window doesn't open / `cv2.error` about display or `imshow`
 
-1. Confirm both devices are on the same subnet — they must be connected to the same router, not one on Wi-Fi and one on a separate Ethernet switch with no shared gateway.
-2. Double-check `LAPTOP_SERVER_IP` in `pi_edge_node.py` — a single wrong digit will silently drop all packets.
-3. **Windows Firewall** commonly blocks inbound UDP. Either temporarily disable the firewall for testing, or add an inbound rule: *Windows Defender Firewall → Advanced Settings → Inbound Rules → New Rule → Port → UDP → 8080 → Allow the connection*.
+The GUI needs a display and the GUI build of OpenCV. Run it from a terminal **inside the Pi's HDMI or VNC desktop session** (see Phase 5), not a bare SSH shell — or pass `--headless` to skip the window. If you intentionally installed `opencv-python-headless`, the window is unavailable — either run `--headless`, or `pip install opencv-python`.
 
 ### Pipeline stays in SLEEP/STANDBY permanently despite motion
 
