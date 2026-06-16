@@ -1,8 +1,6 @@
 import os
 import sys
 import time
-import socket
-import struct
 import threading
 import cv2
 import numpy as np
@@ -43,19 +41,6 @@ last_valid_reading_time = time.time()
 MAX_CONSECUTIVE_DROPS = 3
 consecutive_dropped_readings = 0
 
-# Network routing parameters
-LAPTOP_SERVER_IP = "192.168.1.50"   # ⚠️ UPDATE with your laptop's actual IP address
-NETWORK_PORT = 8080
-
-# Mode ID mapping table for the 40-byte packed UDP payload network socket [cite: 177]
-MODE_IDS = {
-    STATE_SLEEP:     0,
-    STATE_STANDBY:   1,
-    STATE_ACTIVE_LO: 2,
-    STATE_ACTIVE_HI: 3,
-    STATE_WATCHDOG:  4
-}
-
 # Initialize local quantized TFLite engines. A full-integer INT8 model has a
 # fixed input resolution, so adaptive switching uses two interpreters: one at
 # 320x320 for ACTIVE-LO and one at 640x640 for ACTIVE-HI / WATCHDOG. [cite: 174]
@@ -82,6 +67,81 @@ def get_pi_hardware_metrics():
         
     cpu_usage = psutil.cpu_percent(interval=None)
     return cpu_usage, cpu_temp
+
+
+# =========================================================================
+# TELEMETRY RECORD & SINKS
+# =========================================================================
+# Telemetry is assembled into one record (dict) per loop and fanned out to a
+# set of sinks. The terminal sink prints to the Pi's own console (the system
+# runs fully offline). The power and cloud sinks are intentional stubs to be
+# filled in later:
+#   - read_power_w(): INA260 over I2C — whole-Pi 5V rail power draw (watts)
+#   - _cloud_sink():  non-blocking uploader once the cloud platform is chosen
+
+# Contiguous YOLOv8 COCO 80-class index map (0-79), used to label detections in
+# the terminal/telemetry output. IDs are the dense YOLO indices, not the sparse
+# 91-class COCO paper IDs.
+COCO_LABELS = {
+    0: "Student/Person", 1: "Bicycle", 2: "Car", 3: "Motorcycle", 4: "Airplane",
+    5: "Bus", 6: "Train", 7: "Truck", 8: "Boat", 9: "Traffic Light",
+    10: "Fire Hydrant", 11: "Stop Sign", 12: "Parking Meter", 13: "Bench", 14: "Bird",
+    15: "Cat", 16: "Dog", 17: "Horse", 18: "Sheep", 19: "Cow",
+    20: "Elephant", 21: "Bear", 22: "Zebra", 23: "Giraffe", 24: "Backpack",
+    25: "Umbrella", 26: "Handbag", 27: "Tie", 28: "Suitcase", 29: "Frisbee",
+    30: "Skis", 31: "Snowboard", 32: "Sports Ball", 33: "Kite", 34: "Baseball Bat",
+    35: "Baseball Glove", 36: "Skateboard", 37: "Surfboard", 38: "Tennis Racket", 39: "Water Bottle",
+    40: "Wine Glass", 41: "Coffee Cup/Mug", 42: "Fork", 43: "Knife", 44: "Spoon",
+    45: "Bowl", 46: "Banana", 47: "Apple", 48: "Sandwich", 49: "Orange",
+    50: "Broccoli", 51: "Carrot", 52: "Hot Dog", 53: "Pizza", 54: "Donut",
+    55: "Cake", 56: "Chair", 57: "Couch/Sofa", 58: "Potted Plant", 59: "Bed",
+    60: "Dining Table", 61: "Toilet", 62: "Lab Monitor/TV", 63: "Laptop", 64: "Computer Mouse",
+    65: "Remote Control", 66: "Keyboard", 67: "Cell Phone", 68: "Microwave", 69: "Oven",
+    70: "Toaster", 71: "Sink", 72: "Refrigerator", 73: "Book/Notebook", 74: "Clock",
+    75: "Vase", 76: "Scissors", 77: "Teddy Bear", 78: "Hair Drier", 79: "Toothbrush",
+}
+
+
+def read_power_w():
+    """STUB: whole-Pi power draw in watts from the INA260 (I2C).
+
+    Returns None until the sensor is wired in. To enable, read the INA260 here
+    (e.g. adafruit_ina260) and return its .power value converted to watts.
+    """
+    return None
+
+
+def build_detection_pairs(class_ids, confidences):
+    """Map raw YOLO class IDs to (label, confidence%) tuples for logging."""
+    pairs = []
+    for cid, conf in zip(class_ids, confidences):
+        label = COCO_LABELS.get(cid, f"Class_{cid}")
+        pairs.append((label, round(conf * 100, 1)))
+    return pairs
+
+
+def emit_telemetry(record):
+    """Fan a telemetry record out to all active sinks."""
+    _terminal_sink(record)
+    # _cloud_sink(record)   # TODO: enable once the cloud platform is chosen
+
+
+def _terminal_sink(record):
+    """Print one telemetry record to the Pi terminal."""
+    res = record["model_res"]
+    res_str = str(res) if res else "---"
+    lat = record["latency_ms"]
+    lat_str = f"{lat:6.1f}ms" if lat is not None else "    ---  "
+    pwr = record["power_w"]
+    pwr_str = f"{pwr:5.2f}W" if pwr is not None else "  -- W"
+    dets = record["detections"]
+    det_str = ", ".join(f"{name}({conf:.1f}%)" for name, conf in dets) if dets else "none"
+    print(
+        f"[{record['ts']}] {record['state']:<9} | model {res_str:<3} | lat {lat_str} | "
+        f"cpu {record['cpu_pct']:4.1f}% | temp {record['cpu_temp_c']:4.1f}C | pwr {pwr_str} | "
+        f"dist {record['distance_cm']:6.1f}cm | dets: {det_str}",
+        flush=True,
+    )
 
 
 # =========================================================================
@@ -225,17 +285,11 @@ def adaptive_vision_streamer():
     # Pin the vision thread to CPU Cores 2 and 3 to maximize parallel frame math handling
     os.sched_setaffinity(0, {2, 3})
     print(f"[SYSTEM] Vision processing core engine pinned to CPU Cores {os.sched_getaffinity(0)}", flush=True)
-    
-    # Establish persistent telemetry socket link to Laptop using UDP
-    network_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    
+
     camera_feed = cv2.VideoCapture(0)
     camera_feed.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
     camera_feed.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    
-    # Unified Packed Binary Output Definition: Exactly 40 Bytes structural space [cite: 177]
-    udp_format = "<B f f f H f B 4B 4f"
-    
+
     # Internal FSM state tracking variables
     current_state = STATE_SLEEP
     standby_ticks_start = 0.0
@@ -330,21 +384,21 @@ def adaptive_vision_streamer():
         # -----------------------------------------------------------------
         # STEP E: OUTPUT PROFILE EXECUTION BASED ON CURRENT DRIVING STATE
         # -----------------------------------------------------------------
-        mode_id = MODE_IDS[current_state]
-
         # Handle non-inference states (SLEEP & STANDBY) to maximize power savings
         if current_state in [STATE_SLEEP, STATE_STANDBY]:
             cpu_pct, cpu_c = get_pi_hardware_metrics()
-            # Send status update packet containing 0 tracked objects
-            status_payload = struct.pack(
-                udp_format, 
-                mode_id, cpu_pct, cpu_c, distance, 0, 0.0, 
-                0, 255, 255, 255, 255, 0.0, 0.0, 0.0, 0.0
-            )
-            try:
-                network_socket.sendto(status_payload, (LAPTOP_SERVER_IP, NETWORK_PORT))
-            except Exception: pass
-            
+            emit_telemetry({
+                "ts": time.strftime("%H:%M:%S"),
+                "state": current_state,
+                "model_res": None,        # no inference in this state
+                "latency_ms": None,
+                "cpu_pct": cpu_pct,
+                "cpu_temp_c": cpu_c,
+                "power_w": read_power_w(),
+                "distance_cm": distance,
+                "detections": [],
+            })
+
             # Pacing adjustment: deep sleep if sleeping, rapid loop if warming up
             time.sleep(1.0 if current_state == STATE_SLEEP else 0.05)
             continue
@@ -382,27 +436,20 @@ def adaptive_vision_streamer():
         detected_classes, detected_confidences = detector(processed_frame)
         inference_duration_ms = (time.time() - start_inference) * 1000.0
 
-        detection_count = min(len(detected_classes), 4)
-        padded_classes = [255, 255, 255, 255]
-        padded_confidences = [0.0, 0.0, 0.0, 0.0]
-        
-        for i in range(detection_count):
-            padded_classes[i] = detected_classes[i]
-            padded_confidences[i] = detected_confidences[i]
-
+        detection_pairs = build_detection_pairs(detected_classes, detected_confidences)
         cpu_pct, cpu_c = get_pi_hardware_metrics()
 
-        # Compile and serialize the 40-byte binary packet structures [cite: 177]
-        active_payload = struct.pack(
-            udp_format,
-            mode_id, cpu_pct, cpu_c, distance, img_inference_size, inference_duration_ms,
-            detection_count, *padded_classes, *padded_confidences
-        )
-
-        try:
-            network_socket.sendto(active_payload, (LAPTOP_SERVER_IP, NETWORK_PORT))
-        except Exception as tx_err:
-            print(f"[NET ERROR] Log frame dropped: {tx_err}", flush=True)
+        emit_telemetry({
+            "ts": time.strftime("%H:%M:%S"),
+            "state": current_state,
+            "model_res": img_inference_size,   # 320 (ACTIVE-LO) or 640 (ACTIVE-HI / WATCHDOG)
+            "latency_ms": inference_duration_ms,
+            "cpu_pct": cpu_pct,
+            "cpu_temp_c": cpu_c,
+            "power_w": read_power_w(),
+            "distance_cm": distance,
+            "detections": detection_pairs,
+        })
 
         time.sleep(loop_pacing_rate)
 
