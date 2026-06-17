@@ -1,11 +1,37 @@
+# --- Raspberry Pi 4B edge node dependencies ---
+# Targets the Raspberry Pi OS Bookworm system Python (CPython 3.11, aarch64).
+# The pins below exist to satisfy one hard constraint: the TFLite runtime is
+# built against the NumPy 1.x C-ABI, so NumPy (and anything that pulls it in)
+# must stay on the 1.x series.
+
 pigpio>=1.78
-opencv-python>=4.8.0
-numpy>=1.24.0
+
+# The yolov8n_*_int8.tflite models are exported with a newer TFLite flatbuffer
+# schema than the last stable runtime (2.14.0) can parse — it aborts with
+#   "Tensor N is invalidly specified in schema (required_bytes != bytes)".
+# The nightly build carries the newer schema support, so it is the required
+# runtime here. It is also the only option on CPython 3.12+, where no stable
+# tflite-runtime wheel exists.
+# Like the stable build, it is compiled against the NumPy 1.x C-ABI (see cap
+# below) and aborts under NumPy 2.x with
+#   "A module that was compiled using NumPy 1.x cannot be run in NumPy 2.0.x".
+tflite-runtime-nightly
+# tflite-runtime==2.14.0        # stable build — too old to parse these models
+
+# Must stay on the NumPy 1.x series for the tflite-runtime ABI above.
+numpy>=1.24.0,<2.0.0
+
+# opencv-python 4.10+ resolves NumPy 2.x as a dependency, which would drag
+# NumPy past the cap above. The 4.8/4.9 line builds against NumPy 1.x and has
+# prebuilt aarch64 wheels for the Pi.
+opencv-python>=4.8.0,<4.10.0
+
 psutil>=5.9.0
-tflite-runtime>=2.14.0
+
 # opencv-python (the GUI build) is required for the on-Pi demo window. For a
 # remote / no-monitor deployment, run the node with `--headless` and you may
-# instead install the lighter `opencv-python-headless` (no Qt/GUI deps).
+# instead install the lighter `opencv-python-headless` (no Qt/GUI deps) — apply
+# the same <4.10.0 cap to it.
 # pigpio drives the sensors directly off the Pi's GPIO (PIR, LM393, HC-SR04)
 # with hardware-timestamped echo edges. The pigpiod daemon must be running:
 #   sudo systemctl enable --now pigpiod   (or: sudo pigpiod)
