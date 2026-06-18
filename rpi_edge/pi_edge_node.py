@@ -35,6 +35,44 @@ state_mutex = threading.Lock()
 DISTANCE_WINDOW_SIZE = 5
 distance_history = [400.0] * DISTANCE_WINDOW_SIZE
 
+# Multipath spike rejection (Flap-A mitigation). The HC-SR04's wide (~15 deg)
+# beam bounces off walls and furniture, producing single-frame distance jumps
+# that are physically impossible for a moving person (e.g. 218cm -> 37cm -> 218cm
+# in 300ms). Any reading that jumps more than MAX_PLAUSIBLE_JUMP_CM from the
+# current median is treated as a spike and DROPPED, so it never pollutes the
+# filter. The exception is genuine fast movement: if the jump persists for
+# JUMP_CONFIRM_N consecutive readings, we accept it and snap the window to it.
+MAX_PLAUSIBLE_JUMP_CM = 120.0
+JUMP_CONFIRM_N = 3
+consecutive_jump_count = 0
+
+# State-transition debounce (Flap-A mitigation). A single distance reading
+# crossing the 120/160 cm hysteresis band must NOT flip the active model. A
+# HI<->LO switch is committed only when the crossing condition holds for
+# TRANSITION_CONFIRM_N consecutive FSM ticks AND the current state has been held
+# for at least MIN_DWELL_S. Together these clamp the rapid ACTIVE-HI/ACTIVE-LO
+# churn seen when a stationary target sits near a threshold. These gate ONLY the
+# HI<->LO switch; SLEEP/STANDBY/WATCHDOG transitions are unaffected.
+MIN_DWELL_S = 1.5
+TRANSITION_CONFIRM_N = 3
+
+# Presence fusion (Flap-B mitigation). Absence is declared only when PIR motion,
+# a close ultrasonic reading, AND a recent vision person-detection have ALL been
+# quiet for PRESENCE_TIMEOUT_S. This replaces the old "PIR-expired AND far"
+# rule, which mistook a stationary occupant (PIR sees only motion) plus a single
+# spurious sonar spike for an empty room, causing SLEEP<->ACTIVE cycling.
+PRESENCE_TIMEOUT_S   = 12.0
+PRESENCE_DISTANCE_CM = 350.0
+PERSON_CLASS_ID      = 0       # YOLO/COCO dense index for "person"
+# Low-power wind-down (Flap-B energy reclaim). When presence signals go quiet we
+# do NOT jump straight to SLEEP from ACTIVE-HI (the most expensive state). After
+# PRESENCE_GRACE_S of quiet we drop to cheap ACTIVE-LO (320 model) and count down;
+# only after PRESENCE_TIMEOUT_S total do we SLEEP. The wind-down reuses ACTIVE-LO
+# rather than a separate state. Set PRESENCE_GRACE_S to 0 to drop to LO the
+# instant signals lapse; the small default debounces the PRESENCE_DISTANCE_CM
+# boundary so a person hovering near it doesn't twitch HI<->LO.
+PRESENCE_GRACE_S     = 2.0
+
 # Heartbeat line tracking the exact epoch of the last completed ultrasonic echo
 last_valid_reading_time = time.time()
 
@@ -271,7 +309,7 @@ def gpio_harvester_worker():
     print(f"[SYSTEM] GPIO Sensor Harvester pinned to CPU Core {os.sched_getaffinity(0)}", flush=True)
 
     global last_valid_reading_time, distance_history, consecutive_dropped_readings
-    global pigpio_fault, _echo_pulse_ready, _echo_duration_us
+    global pigpio_fault, _echo_pulse_ready, _echo_duration_us, consecutive_jump_count
 
     pi = pigpio.pi()  # connects to the local pigpiod daemon
     if not pi.connected:
@@ -316,9 +354,20 @@ def gpio_harvester_worker():
                 # sonar is alive, so refresh the watchdog timer and clear drops.
                 with state_mutex:
                     if dist_cm > 0:
-                        distance_history.pop(0)
-                        distance_history.append(dist_cm)
-                        # True median removes spikes from ultrasonic echo multipath
+                        prev_median = float(np.median(distance_history))
+                        if abs(dist_cm - prev_median) > MAX_PLAUSIBLE_JUMP_CM:
+                            # Suspected multipath spike. Only believe it once it
+                            # repeats JUMP_CONFIRM_N times (= real fast movement).
+                            consecutive_jump_count += 1
+                            if consecutive_jump_count >= JUMP_CONFIRM_N:
+                                distance_history = [dist_cm] * DISTANCE_WINDOW_SIZE
+                                consecutive_jump_count = 0
+                            # else: drop this reading; do NOT pollute the median
+                        else:
+                            consecutive_jump_count = 0
+                            distance_history.pop(0)
+                            distance_history.append(dist_cm)
+                        # True median removes residual jitter from the accepted window
                         shared_state["distance"] = float(np.median(distance_history))
                     consecutive_dropped_readings = 0
                 last_valid_reading_time = time.time()
@@ -374,6 +423,35 @@ def adaptive_vision_streamer():
     clahe_active = False
     prev_loop_t = time.time()   # for live FPS estimation
 
+    # Flap-A debounce trackers for the HI<->LO switch (see MIN_DWELL_S above).
+    state_entered_at = time.time()
+    last_state_seen = current_state
+    hilo_candidate = None
+    hilo_candidate_count = 0
+
+    # Flap-B presence-fusion trackers (see PRESENCE_TIMEOUT_S above). The epoch is
+    # refreshed by any presence signal; last_person_epoch is the vision vote.
+    last_presence_epoch = time.time()
+    last_person_epoch = 0.0
+
+    def _hilo_confirmed(target):
+        """Return True only when `target` has been requested for
+        TRANSITION_CONFIRM_N consecutive ticks AND the current state has been
+        held >= MIN_DWELL_S. Counts up across ticks; reset via _hilo_reset()."""
+        nonlocal hilo_candidate, hilo_candidate_count
+        if target != hilo_candidate:
+            hilo_candidate, hilo_candidate_count = target, 1
+        else:
+            hilo_candidate_count += 1
+        dwell_ok = (loop_t - state_entered_at) >= MIN_DWELL_S
+        return dwell_ok and hilo_candidate_count >= TRANSITION_CONFIRM_N
+
+    def _hilo_reset():
+        """Clear a partial confirmation when the crossing condition lapses, so
+        only CONSECUTIVE qualifying ticks ever accumulate."""
+        nonlocal hilo_candidate, hilo_candidate_count
+        hilo_candidate, hilo_candidate_count = None, 0
+
     print("[INIT] Launching 5-State Finite State Machine Kernel Loop...", flush=True)
 
     while True:
@@ -381,6 +459,13 @@ def adaptive_vision_streamer():
         loop_t = time.time()
         fps = 1.0 / (loop_t - prev_loop_t) if loop_t > prev_loop_t else 0.0
         prev_loop_t = loop_t
+
+        # Stamp when the FSM last changed state, so MIN_DWELL_S can be measured.
+        # Also clears any partial HI<->LO confirmation carried from the old state.
+        if current_state != last_state_seen:
+            state_entered_at = loop_t
+            last_state_seen = current_state
+            hilo_candidate, hilo_candidate_count = None, 0
 
         # -----------------------------------------------------------------
         # STEP A: WATCHDOG FAILSAFE OVERRIDE RULE EVALUATION (ENHANCED)
@@ -412,10 +497,18 @@ def adaptive_vision_streamer():
             is_dark = shared_state["is_dark"]
             last_motion = shared_state["last_motion_epoch"]
             
-        # Presence calculations: PIR expired (5s window) AND filtered distance > 350 cm
-        pir_expired = (time.time() - last_motion) >= 5.0
-        presence_lost = pir_expired and (distance > 350.0)
-        presence_confirmed = not presence_lost
+        # Presence fusion (Flap-B): keep presence alive if ANY signal fires.
+        # quiet_for then drives the two-stage wind-down: grace -> cheap ACTIVE-LO,
+        # timeout -> SLEEP.
+        now = time.time()
+        last_presence_epoch = max(last_presence_epoch, last_motion)   # PIR motion
+        if distance < PRESENCE_DISTANCE_CM:
+            last_presence_epoch = now                                 # something is close
+        if last_person_epoch > last_presence_epoch:
+            last_presence_epoch = last_person_epoch                   # vision saw a person
+        quiet_for    = now - last_presence_epoch
+        winding_down = quiet_for > PRESENCE_GRACE_S      # quiet -> cheap LO wind-down
+        absent       = quiet_for > PRESENCE_TIMEOUT_S    # quiet long enough -> SLEEP
 
         # -----------------------------------------------------------------
         # STEP C: FSM STATE TRANSITION HANDLING MATRIX
@@ -439,20 +532,32 @@ def adaptive_vision_streamer():
                 print(f"[FSM TRANSITION] STANDBY -> {current_state} based on target distance: {distance:.1f}cm", flush=True)
 
         elif current_state == STATE_ACTIVE_LO:
-            if presence_lost:
+            if absent:
                 current_state = STATE_SLEEP
                 print("[FSM TRANSITION] ACTIVE-LO -> SLEEP. Target vacancy confirmed.", flush=True)
-            elif distance > 160.0:  # Hysteresis exit boundary constraint check
-                current_state = STATE_ACTIVE_HI
-                print(f"[FSM TRANSITION] ACTIVE-LO -> ACTIVE-HI. Target exited close-zone threshold (> 160cm).", flush=True)
+            elif winding_down:
+                # Presence signals quiet: hold cheap LO as the low-power wind-down
+                # and do NOT escalate to HI while counting down to SLEEP.
+                _hilo_reset()
+            elif distance > 160.0:  # present + far -> high-res; debounced (A1+A2)
+                if _hilo_confirmed(STATE_ACTIVE_HI):
+                    current_state = STATE_ACTIVE_HI
+                    print(f"[FSM TRANSITION] ACTIVE-LO -> ACTIVE-HI. Target exited close-zone threshold (> 160cm).", flush=True)
+            else:  # crossing condition lapsed -> drop any partial confirmation
+                _hilo_reset()
 
         elif current_state == STATE_ACTIVE_HI:
-            if presence_lost:
-                current_state = STATE_SLEEP
-                print("[FSM TRANSITION] ACTIVE-HI -> SLEEP. Target vacancy confirmed.", flush=True)
-            elif distance < 120.0:  # Hysteresis entry boundary constraint check
+            if winding_down:
+                # Presence signals quiet: drop to cheap LO for the wind-down
+                # countdown instead of burning HI inference right up to SLEEP.
                 current_state = STATE_ACTIVE_LO
-                print(f"[FSM TRANSITION] ACTIVE-HI -> ACTIVE-LO. Target entered close-zone threshold (< 120cm).", flush=True)
+                print("[FSM TRANSITION] ACTIVE-HI -> ACTIVE-LO. Presence quiet; low-power wind-down before sleep.", flush=True)
+            elif distance < 120.0:  # present + close -> low-res; debounced (A1+A2)
+                if _hilo_confirmed(STATE_ACTIVE_LO):
+                    current_state = STATE_ACTIVE_LO
+                    print(f"[FSM TRANSITION] ACTIVE-HI -> ACTIVE-LO. Target entered close-zone threshold (< 120cm).", flush=True)
+            else:  # crossing condition lapsed -> drop any partial confirmation
+                _hilo_reset()
 
         # -----------------------------------------------------------------
         # STEP D: ORTHOGONAL LDR PREPROCESSING GATE EVALUATION
@@ -497,7 +602,7 @@ def adaptive_vision_streamer():
         if not success or raw_frame is None:
             continue
 
-        # Apply orthogonal image preprocessing layers if activated [cite: 359]
+        # Apply orthogonal image preprocessing layers if activated 
         if clahe_active:
             yuv_buffer = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2YUV)
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
@@ -524,6 +629,11 @@ def adaptive_vision_streamer():
         start_inference = time.time()
         detected_classes, detected_confidences, detected_boxes = detector(processed_frame)
         inference_duration_ms = (time.time() - start_inference) * 1000.0
+
+        # Flap-B vision vote: a detected person refreshes presence directly, so a
+        # motionless-but-visible occupant keeps the node awake even with no PIR.
+        if PERSON_CLASS_ID in detected_classes:
+            last_person_epoch = time.time()
 
         detection_pairs = build_detection_pairs(detected_classes, detected_confidences)
         cpu_pct, cpu_c = get_pi_hardware_metrics()
