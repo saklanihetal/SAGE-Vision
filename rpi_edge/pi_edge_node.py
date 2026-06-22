@@ -10,117 +10,186 @@ import pigpio
 from yolo_tflite import YoloTFLite
 
 # =========================================================================
-# SECTION 1: GLOBAL STATE ENGINE CONFIGURATIONS & FINITE STATE MACHINE TOKENS
+# FSM STATES
 # =========================================================================
-
-# Explicit Finite State Machine tokens representing the 5 core operational states
+# The node runs a 5-state finite state machine. SLEEP/STANDBY do no inference;
+# ACTIVE-LO runs the 320 model, ACTIVE-HI and WATCHDOG run the 640 model.
 STATE_SLEEP     = "SLEEP"
 STATE_STANDBY   = "STANDBY"
 STATE_ACTIVE_LO = "ACTIVE-LO"
 STATE_ACTIVE_HI = "ACTIVE-HI"
 STATE_WATCHDOG  = "WATCHDOG"
 
-# Initialize thread-safe shared state cache dictionary. The LDR is now a digital
-# LM393 comparator (active-low), so light is a boolean dark/bright flag rather
-# than an analog value.
+# =========================================================================
+# SHARED SENSOR STATE
+# =========================================================================
+# The GPIO harvester thread writes here; the vision/FSM thread reads. Every
+# access is guarded by state_mutex. The LDR is a digital LM393 comparator
+# (active-low), so light is a dark/bright boolean, not an analog value.
 shared_state = {
     "pir": 0,
-    "distance": 400.0,  # Bounded initialized safe default far distance value
+    "distance": 400.0,            # safe far-distance default until the first echo
     "is_dark": False,
-    "last_motion_epoch": time.time()
+    "last_motion_epoch": time.time(),
 }
 state_mutex = threading.Lock()
 
-# Rolling buffer array to compute a true median filter for the ultrasonic metrics
+# =========================================================================
+# DISTANCE FILTERING (ultrasonic spike rejection)
+# =========================================================================
+# Rolling window feeding a median filter that smooths ultrasonic jitter.
 DISTANCE_WINDOW_SIZE = 5
 distance_history = [400.0] * DISTANCE_WINDOW_SIZE
 
-# Multipath spike rejection (Flap-A mitigation). The HC-SR04's wide (~15 deg)
-# beam bounces off walls and furniture, producing single-frame distance jumps
-# that are physically impossible for a moving person (e.g. 218cm -> 37cm -> 218cm
-# in 300ms). Any reading that jumps more than MAX_PLAUSIBLE_JUMP_CM from the
-# current median is treated as a spike and DROPPED, so it never pollutes the
-# filter. The exception is genuine fast movement: if the jump persists for
-# JUMP_CONFIRM_N consecutive readings, we accept it and snap the window to it.
+# Multipath spike rejection. The HC-SR04's wide (~15 deg) beam bounces off walls
+# and furniture, producing single-frame jumps that no real person could make
+# (e.g. 218cm -> 37cm -> 218cm in 300ms). A reading that jumps more than
+# MAX_PLAUSIBLE_JUMP_CM from the current median is dropped before it reaches the
+# filter. The exception is genuine fast movement: if the jump repeats for
+# JUMP_CONFIRM_N readings in a row, we accept it and snap the window onto it.
 MAX_PLAUSIBLE_JUMP_CM = 120.0
 JUMP_CONFIRM_N = 3
 consecutive_jump_count = 0
 
-# State-transition debounce (Flap-A mitigation). A single distance reading
-# crossing the 120/160 cm hysteresis band must NOT flip the active model. A
-# HI<->LO switch is committed only when the crossing condition holds for
-# TRANSITION_CONFIRM_N consecutive FSM ticks AND the current state has been held
-# for at least MIN_DWELL_S. Together these clamp the rapid ACTIVE-HI/ACTIVE-LO
-# churn seen when a stationary target sits near a threshold. These gate ONLY the
-# HI<->LO switch; SLEEP/STANDBY/WATCHDOG transitions are unaffected.
-MIN_DWELL_S = 1.5
-TRANSITION_CONFIRM_N = 3
+# =========================================================================
+# PRESENCE FUSION + HYSTERESIS
+# =========================================================================
+# Absence is declared only when PIR motion, a close ultrasonic reading, AND a
+# recent vision person-detection have ALL been quiet for PRESENCE_TIMEOUT_S.
+# This replaces the old "PIR-expired AND far" rule, which mistook a stationary
+# occupant plus one spurious sonar spike for an empty room.
+PRESENCE_TIMEOUT_S = 12.0
+PERSON_CLASS_ID    = 0            # YOLO/COCO dense index for "person"
 
-# Presence fusion (Flap-B mitigation). Absence is declared only when PIR motion,
-# a close ultrasonic reading, AND a recent vision person-detection have ALL been
-# quiet for PRESENCE_TIMEOUT_S. This replaces the old "PIR-expired AND far"
-# rule, which mistook a stationary occupant (PIR sees only motion) plus a single
-# spurious sonar spike for an empty room, causing SLEEP<->ACTIVE cycling.
-PRESENCE_TIMEOUT_S   = 12.0
-PRESENCE_DISTANCE_CM = 350.0
-PERSON_CLASS_ID      = 0       # YOLO/COCO dense index for "person"
-# Low-power wind-down (Flap-B energy reclaim). When presence signals go quiet we
-# do NOT jump straight to SLEEP from ACTIVE-HI (the most expensive state). After
-# PRESENCE_GRACE_S of quiet we drop to cheap ACTIVE-LO (320 model) and count down;
-# only after PRESENCE_TIMEOUT_S total do we SLEEP. The wind-down reuses ACTIVE-LO
-# rather than a separate state. Set PRESENCE_GRACE_S to 0 to drop to LO the
-# instant signals lapse; the small default debounces the PRESENCE_DISTANCE_CM
-# boundary so a person hovering near it doesn't twitch HI<->LO.
-PRESENCE_GRACE_S     = 2.0
+# Distance hysteresis between waking and staying awake. A target must step
+# inside WAKE_DISTANCE_CM to wake the node from SLEEP, but presence is kept
+# alive out to the wider PRESENCE_DISTANCE_CM. The gap stops a target lingering
+# near the boundary from repeatedly re-crossing the wake line.
+WAKE_DISTANCE_CM     = 300.0      # closer threshold: wake from SLEEP
+PRESENCE_DISTANCE_CM = 350.0      # wider threshold: keep-awake / presence vote
 
-# Heartbeat line tracking the exact epoch of the last completed ultrasonic echo
+# Two-stage low-power wind-down. When presence goes quiet we do NOT jump straight
+# from the expensive ACTIVE-HI to SLEEP. After PRESENCE_GRACE_S of quiet we drop
+# to the cheap ACTIVE-LO and keep counting down; only at PRESENCE_TIMEOUT_S do we
+# SLEEP. The small grace also debounces the presence boundary so a target
+# hovering near it doesn't twitch HI<->LO.
+PRESENCE_GRACE_S = 2.0
+
+# HI<->LO distance band. Below CLOSE -> low-res; above FAR -> high-res; the gap
+# between them is the hysteresis band that prevents churn near the threshold.
+HILO_CLOSE_CM = 120.0
+HILO_FAR_CM   = 160.0
+
+# =========================================================================
+# TRANSITION GATE TUNING (per edge)
+# =========================================================================
+# Each debounced edge requires its condition to hold continuously for HOLD_S
+# AND the current state to have been occupied for at least DWELL_S before it
+# commits. See TransitionGate below.
+HILO_HOLD_S  = 0.75               # HI<->LO: condition must persist this long
+HILO_DWELL_S = 1.5                # HI<->LO: minimum time between switches
+WAKE_HOLD_S  = 0.5                # SLEEP->wake: wake signal must persist this long
+WATCHDOG_RECOVER_HOLD_S = 1.5     # leaving WATCHDOG: sonar must stay healthy this long
+WATCHDOG_MIN_DWELL_S    = 1.0     # minimum time to stay in WATCHDOG once entered
+
+STANDBY_WARMUP_S = 0.2            # transient warmup hold before STANDBY picks a model
+
+# =========================================================================
+# WATCHDOG / SONAR LIVENESS
+# =========================================================================
+# Epoch of the last completed ultrasonic echo (the sonar heartbeat).
 last_valid_reading_time = time.time()
 
-# Failsafe limit: if 3 consecutive sonar triggers return no echo, trigger WATCHDOG
+# Failsafe: this many consecutive no-echo triggers counts as a dead sonar.
 MAX_CONSECUTIVE_DROPS = 3
 consecutive_dropped_readings = 0
 
-# Initialize local quantized TFLite engines. A full-integer INT8 model has a
-# fixed input resolution, so adaptive switching uses two interpreters: one at
-# 320x320 for ACTIVE-LO and one at 640x640 for ACTIVE-HI / WATCHDOG. [cite: 174]
+# Set when a pigpio/daemon call fails -> forces an immediate WATCHDOG (the
+# equivalent of the old "USB serial unplugged" detection).
+pigpio_fault = False
+
+# =========================================================================
+# MODELS
+# =========================================================================
+# A full-integer INT8 model has a fixed input resolution, so adaptive switching
+# uses two interpreters: 320x320 for ACTIVE-LO, 640x640 for ACTIVE-HI/WATCHDOG.
 _MODEL_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_LO_PATH = os.path.join(_MODEL_DIR, "yolov8n_320_int8.tflite")
 MODEL_HI_PATH = os.path.join(_MODEL_DIR, "yolov8n_640_int8.tflite")
 try:
     model_lo = YoloTFLite(MODEL_LO_PATH)  # 320x320
     model_hi = YoloTFLite(MODEL_HI_PATH)  # 640x640
-    print("[SYSTEM] TFLite INT8 YOLO engines (320 + 640) successfully initialized.", flush=True)
+    print("[SYSTEM] TFLite INT8 YOLO engines (320 + 640) initialized.", flush=True)
 except Exception as e:
     print(f"[FATAL] Failed to locate or parse TFLite model file: {e}", flush=True)
     sys.exit(1)
 
 
+# =========================================================================
+# TRANSITION GATE
+# =========================================================================
+class TransitionGate:
+    """Debounces FSM state changes so a brief sensor blip can't flip states.
+
+    A transition to `target` commits only when BOTH conditions hold:
+      * its condition has stayed true continuously for `hold_s` seconds, and
+      * the current state has been occupied for at least `dwell_s` seconds.
+
+    Only one candidate transition is tracked at a time: requesting a different
+    target, or calling clear(), resets the streak. Because the streak is timed
+    rather than counted in ticks, the gate behaves identically regardless of how
+    fast the FSM loop happens to be running in the current state.
+
+    Call enter() on every committed state change to restart the dwell clock.
+    """
+
+    def __init__(self):
+        self._entered_at = time.time()   # when the current state was entered
+        self._candidate = None           # target currently accumulating a streak
+        self._streak_start = 0.0         # when the candidate's condition first held
+
+    def enter(self, now):
+        """Record a fresh state entry: reset the dwell clock and any partial streak."""
+        self._entered_at = now
+        self._candidate = None
+        self._streak_start = 0.0
+
+    def request(self, target, now, hold_s, dwell_s):
+        """Vote for a transition to `target` this tick; return True once confirmed."""
+        if target != self._candidate:
+            self._candidate = target
+            self._streak_start = now
+        held_long_enough = (now - self._streak_start) >= hold_s
+        dwell_satisfied  = (now - self._entered_at) >= dwell_s
+        return held_long_enough and dwell_satisfied
+
+    def clear(self):
+        """Abandon the current candidate when its condition stops holding."""
+        self._candidate = None
+        self._streak_start = 0.0
+
+
 def get_pi_hardware_metrics():
-    """Reads internal Pi telemetry sensors for project evaluation data."""
+    """Return (cpu_usage_pct, cpu_temp_c) from the Pi's internal telemetry."""
     try:
         with open("/sys/class/thermal/thermal_zone0/temp", "r") as f:
-            temp_raw = int(f.read())
-        cpu_temp = temp_raw / 1000.0
+            cpu_temp = int(f.read()) / 1000.0
     except Exception:
         cpu_temp = 0.0
-        
     cpu_usage = psutil.cpu_percent(interval=None)
     return cpu_usage, cpu_temp
 
 
 # =========================================================================
-# TELEMETRY RECORD & SINKS
+# TELEMETRY
 # =========================================================================
-# Telemetry is assembled into one record (dict) per loop and fanned out to a
-# set of sinks. The terminal sink prints to the Pi's own console (the system
-# runs fully offline). The power and cloud sinks are intentional stubs to be
-# filled in later:
-#   - read_power_w(): INA260 over I2C — whole-Pi 5V rail power draw (watts)
+# One telemetry record (dict) is assembled per loop and fanned out to sinks.
+# The terminal sink prints to the Pi's own console (the node runs fully offline).
+# read_power_w() and _cloud_sink() are intentional stubs filled in later:
+#   - read_power_w(): INA260 over I2C -> whole-Pi 5V rail power draw (watts)
 #   - _cloud_sink():  non-blocking uploader once the cloud platform is chosen
 
-# Contiguous YOLOv8 COCO 80-class index map (0-79), used to label detections in
-# the terminal/telemetry output. IDs are the dense YOLO indices, not the sparse
-# 91-class COCO paper IDs.
+# YOLOv8 COCO 80-class map (dense indices 0-79, not the sparse 91-class paper IDs).
 COCO_LABELS = {
     0: "Student/Person", 1: "Bicycle", 2: "Car", 3: "Motorcycle", 4: "Airplane",
     5: "Bus", 6: "Train", 7: "Truck", 8: "Boat", 9: "Traffic Light",
@@ -152,11 +221,10 @@ def read_power_w():
 
 def build_detection_pairs(class_ids, confidences):
     """Map raw YOLO class IDs to (label, confidence%) tuples for logging."""
-    pairs = []
-    for cid, conf in zip(class_ids, confidences):
-        label = COCO_LABELS.get(cid, f"Class_{cid}")
-        pairs.append((label, round(conf * 100, 1)))
-    return pairs
+    return [
+        (COCO_LABELS.get(cid, f"Class_{cid}"), round(conf * 100, 1))
+        for cid, conf in zip(class_ids, confidences)
+    ]
 
 
 def emit_telemetry(record):
@@ -211,7 +279,6 @@ def _text(img, s, org, color, scale=0.5, thick=1, outline=False):
 
 def _compose_gui(video, record, boxes, detection_pairs):
     """Draw blue boxes on the video and stack a solid HUD header above it."""
-    # Blue detection boxes + plain blue labels (black-outlined for legibility)
     for (x1, y1, x2, y2), (name, conf) in zip(boxes, detection_pairs):
         cv2.rectangle(video, (x1, y1), (x2, y2), BOX_COLOR, 2)
         _text(video, f"{name} {conf:.0f}%", (x1, max(y1 - 6, 12)), BOX_COLOR, 0.5, 1, outline=True)
@@ -257,7 +324,7 @@ def show_gui(video, record, boxes, detection_pairs):
 
 
 # =========================================================================
-# THREAD 1: ASYNCHRONOUS GPIO SENSOR HARVESTER (PINNED TO CPU CORE 1)
+# THREAD 1: GPIO SENSOR HARVESTER (pinned to CPU core 1)
 # =========================================================================
 # Hardware GPIO pin map (BCM numbering). The HC-SR04 ECHO line is 5V and MUST
 # pass through a resistor voltage divider down to 3.3V before reaching the Pi.
@@ -266,7 +333,7 @@ LDR_PIN  = 27   # LM393 light comparator digital output (active-low: LOW = dark)
 TRIG_PIN = 23   # HC-SR04 trigger output
 ECHO_PIN = 24   # HC-SR04 echo input (via 5V -> 3.3V voltage divider)
 
-# Ultrasonic timing constants mirroring the original 16.6 Hz firmware cadence
+# Ultrasonic timing.
 TRIGGER_INTERVAL_S = 0.060   # ~16.6 Hz sonar trigger pace
 ECHO_TIMEOUT_S     = 0.058   # TUNABLE: no echo within this window => dead sonar.
                              # Must exceed your HC-SR04's no-object pulse length
@@ -274,23 +341,18 @@ ECHO_TIMEOUT_S     = 0.058   # TUNABLE: no echo within this window => dead sonar
 
 # Echo pulse state shared between the pigpio edge callback and the harvester loop.
 # pigpio fires the callback from its own real-time thread (the equivalent of the
-# ESP32 IRAM ISR), so reads/writes are guarded by echo_lock (the critical section).
+# ESP32 IRAM ISR), so accesses are guarded by echo_lock.
 echo_lock = threading.Lock()
 _echo_start_tick = 0
 _echo_pulse_ready = False
 _echo_duration_us = 0
 
-# Set when a pigpio/daemon call fails -> forces an immediate WATCHDOG (the
-# equivalent of the old "USB serial unplugged" detection).
-pigpio_fault = False
-
 
 def _echo_edge_callback(gpio, level, tick):
-    """pigpio EITHER_EDGE callback: timestamps the HC-SR04 echo pulse width.
+    """pigpio EITHER_EDGE callback: timestamp the HC-SR04 echo pulse width.
 
-    Mirrors the firmware ISR: rising edge stamps the start tick, falling edge
-    computes the pulse duration. pigpio.tickDiff handles the 32-bit microsecond
-    counter wraparound correctly.
+    Rising edge stamps the start tick; falling edge computes the pulse duration.
+    pigpio.tickDiff handles the 32-bit microsecond counter wraparound.
     """
     global _echo_start_tick, _echo_pulse_ready, _echo_duration_us
     with echo_lock:
@@ -304,14 +366,14 @@ def _echo_edge_callback(gpio, level, tick):
 
 
 def gpio_harvester_worker():
-    # Pin this thread to CPU Core 1 to isolate sensor sampling from inference jitter
+    # Pin to CPU core 1 to isolate sensor sampling from inference jitter.
     os.sched_setaffinity(0, {1})
-    print(f"[SYSTEM] GPIO Sensor Harvester pinned to CPU Core {os.sched_getaffinity(0)}", flush=True)
+    print(f"[SYSTEM] GPIO sensor harvester pinned to CPU core {os.sched_getaffinity(0)}", flush=True)
 
     global last_valid_reading_time, distance_history, consecutive_dropped_readings
     global pigpio_fault, _echo_pulse_ready, _echo_duration_us, consecutive_jump_count
 
-    pi = pigpio.pi()  # connects to the local pigpiod daemon
+    pi = pigpio.pi()  # connect to the local pigpiod daemon
     if not pi.connected:
         print("[FATAL] Cannot connect to pigpiod. Start it with 'sudo pigpiod'.", flush=True)
         sys.exit(1)
@@ -331,14 +393,14 @@ def gpio_harvester_worker():
         try:
             now = time.monotonic()
 
-            # 1. Non-blocking periodic 10us trigger pulse (mirrors firmware cadence)
+            # 1. Fire a non-blocking 10us trigger pulse on the fixed cadence.
             if now - last_trigger >= TRIGGER_INTERVAL_S:
                 last_trigger = now
-                pi.gpio_trigger(TRIG_PIN, 10, 1)   # 10 microsecond HIGH pulse
+                pi.gpio_trigger(TRIG_PIN, 10, 1)
                 awaiting_echo = True
                 trigger_sent_at = now
 
-            # 2. Consume a completed echo transaction if one is ready
+            # 2. Consume a completed echo transaction, if one is ready.
             with echo_lock:
                 pulse_ready = _echo_pulse_ready
                 duration_us = _echo_duration_us
@@ -347,39 +409,39 @@ def gpio_harvester_worker():
             if pulse_ready:
                 awaiting_echo = False
                 dist_cm = (duration_us * 0.0343) / 2.0
-                # Outlier rejection + out-of-range sentinel (identical to firmware)
+                # Clamp out-of-range readings to a sentinel.
                 if dist_cm > 500.0 or dist_cm <= 0:
                     dist_cm = -1.0
-                # A COMPLETED echo (even out-of-range) is a valid heartbeat: the
-                # sonar is alive, so refresh the watchdog timer and clear drops.
+
+                # A completed echo (even out-of-range) means the sonar is alive,
+                # so it counts as a heartbeat: refresh the watchdog and clear drops.
                 with state_mutex:
                     if dist_cm > 0:
                         prev_median = float(np.median(distance_history))
                         if abs(dist_cm - prev_median) > MAX_PLAUSIBLE_JUMP_CM:
-                            # Suspected multipath spike. Only believe it once it
+                            # Suspected multipath spike: only believe it once it
                             # repeats JUMP_CONFIRM_N times (= real fast movement).
                             consecutive_jump_count += 1
                             if consecutive_jump_count >= JUMP_CONFIRM_N:
                                 distance_history = [dist_cm] * DISTANCE_WINDOW_SIZE
                                 consecutive_jump_count = 0
-                            # else: drop this reading; do NOT pollute the median
+                            # else: drop it; do NOT pollute the median window
                         else:
                             consecutive_jump_count = 0
                             distance_history.pop(0)
                             distance_history.append(dist_cm)
-                        # True median removes residual jitter from the accepted window
                         shared_state["distance"] = float(np.median(distance_history))
                     consecutive_dropped_readings = 0
                 last_valid_reading_time = time.time()
 
-            # 3. Sonar liveness: NO echo edges at all within the window => dead sensor
+            # 3. Sonar liveness: no echo edges at all within the window => a drop.
             elif awaiting_echo and (now - trigger_sent_at) > ECHO_TIMEOUT_S:
                 awaiting_echo = False
                 with state_mutex:
                     consecutive_dropped_readings += 1
 
             # 4. Poll the level-read sensors (PIR motion, LM393 light). These are
-            #    not health-monitorable: a dead level pin reads a constant value
+            #    NOT health-monitorable: a dead level pin reads a constant value
             #    indistinguishable from a genuinely quiet/lit room.
             pir_val = pi.read(PIR_PIN)
             is_dark = (pi.read(LDR_PIN) == 0)   # active-low: LOW output = dark
@@ -393,7 +455,7 @@ def gpio_harvester_worker():
             time.sleep(0.01)   # light yield; pigpiod captures echo edges independently
 
         except Exception as loop_fault:
-            # A pigpio call failed (e.g. pigpiod died) -> flag immediate failsafe
+            # A pigpio call failed (e.g. pigpiod died) -> flag immediate failsafe.
             pigpio_fault = True
             with state_mutex:
                 consecutive_dropped_readings += 1
@@ -402,12 +464,12 @@ def gpio_harvester_worker():
 
 
 # =========================================================================
-# THREAD 2: 5-STATE ADAPTIVE INFERENCE ENGINE (PINNED TO CPU CORES 2 & 3)
+# THREAD 2: 5-STATE ADAPTIVE INFERENCE ENGINE (pinned to CPU cores 2 & 3)
 # =========================================================================
 def adaptive_vision_streamer():
-    # Pin the vision thread to CPU Cores 2 and 3 to maximize parallel frame math handling
+    # Pin to CPU cores 2 & 3 so frame math runs parallel to sensor sampling.
     os.sched_setaffinity(0, {2, 3})
-    print(f"[SYSTEM] Vision processing core engine pinned to CPU Cores {os.sched_getaffinity(0)}", flush=True)
+    print(f"[SYSTEM] Vision engine pinned to CPU cores {os.sched_getaffinity(0)}", flush=True)
 
     camera_feed = cv2.VideoCapture(0)
     camera_feed.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -417,169 +479,151 @@ def adaptive_vision_streamer():
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW_NAME, 640, HEADER_H + 480)
 
-    # Internal FSM state tracking variables
+    # FSM state. The single TransitionGate debounces every state change; it is
+    # re-armed with gate.enter() at each commit so dwell is measured per state.
     current_state = STATE_SLEEP
-    standby_ticks_start = 0.0
+    gate = TransitionGate()
+    standby_start = 0.0
     clahe_active = False
-    prev_loop_t = time.time()   # for live FPS estimation
+    prev_loop_t = time.time()     # for live FPS estimation
 
-    # Flap-A debounce trackers for the HI<->LO switch (see MIN_DWELL_S above).
-    state_entered_at = time.time()
-    last_state_seen = current_state
-    hilo_candidate = None
-    hilo_candidate_count = 0
-
-    # Flap-B presence-fusion trackers (see PRESENCE_TIMEOUT_S above). The epoch is
-    # refreshed by any presence signal; last_person_epoch is the vision vote.
+    # Presence-fusion trackers. last_presence_epoch is refreshed by any presence
+    # signal; last_person_epoch is the vision vote, refreshed when YOLO sees a person.
     last_presence_epoch = time.time()
     last_person_epoch = 0.0
 
-    def _hilo_confirmed(target):
-        """Return True only when `target` has been requested for
-        TRANSITION_CONFIRM_N consecutive ticks AND the current state has been
-        held >= MIN_DWELL_S. Counts up across ticks; reset via _hilo_reset()."""
-        nonlocal hilo_candidate, hilo_candidate_count
-        if target != hilo_candidate:
-            hilo_candidate, hilo_candidate_count = target, 1
-        else:
-            hilo_candidate_count += 1
-        dwell_ok = (loop_t - state_entered_at) >= MIN_DWELL_S
-        return dwell_ok and hilo_candidate_count >= TRANSITION_CONFIRM_N
-
-    def _hilo_reset():
-        """Clear a partial confirmation when the crossing condition lapses, so
-        only CONSECUTIVE qualifying ticks ever accumulate."""
-        nonlocal hilo_candidate, hilo_candidate_count
-        hilo_candidate, hilo_candidate_count = None, 0
-
-    print("[INIT] Launching 5-State Finite State Machine Kernel Loop...", flush=True)
+    print("[INIT] Launching 5-state FSM kernel loop...", flush=True)
 
     while True:
-        # Live loop-rate (effective display FPS, includes pacing/sleep)
-        loop_t = time.time()
-        fps = 1.0 / (loop_t - prev_loop_t) if loop_t > prev_loop_t else 0.0
-        prev_loop_t = loop_t
-
-        # Stamp when the FSM last changed state, so MIN_DWELL_S can be measured.
-        # Also clears any partial HI<->LO confirmation carried from the old state.
-        if current_state != last_state_seen:
-            state_entered_at = loop_t
-            last_state_seen = current_state
-            hilo_candidate, hilo_candidate_count = None, 0
+        now = time.time()
+        fps = 1.0 / (now - prev_loop_t) if now > prev_loop_t else 0.0
+        prev_loop_t = now
 
         # -----------------------------------------------------------------
-        # STEP A: WATCHDOG FAILSAFE OVERRIDE RULE EVALUATION (ENHANCED)
+        # STEP A: WATCHDOG FAILSAFE (entry is immediate; recovery is gated)
         # -----------------------------------------------------------------
-        time_since_last_valid_read = time.time() - last_valid_reading_time
-
+        # The sonar is the only health-monitorable sensor. It is unhealthy if the
+        # daemon faulted, no valid echo has arrived for 2s, or consecutive echo
+        # timeouts hit the drop threshold.
+        time_since_last_valid_read = now - last_valid_reading_time
         with state_mutex:
             drops_count = consecutive_dropped_readings
+        sonar_unhealthy = (pigpio_fault
+                           or time_since_last_valid_read > 2.0
+                           or drops_count >= MAX_CONSECUTIVE_DROPS)
 
-        # Failsafe triggers on: lost pigpiod connection, 2s with no valid echo,
-        # OR consecutive sonar echo timeouts hitting the drop threshold.
-        if pigpio_fault or time_since_last_valid_read > 2.0 or drops_count >= MAX_CONSECUTIVE_DROPS:
-            if current_state != STATE_WATCHDOG:
-                print(f"[WATCHDOG CRITICAL] Sensor feed compromised! "
-                      f"(pigpio_fault={pigpio_fault}, elapsed: {time_since_last_valid_read:.1f}s, "
-                      f"consecutive drops: {drops_count}). Entering Failsafe Mode.", flush=True)
-                current_state = STATE_WATCHDOG
+        if current_state != STATE_WATCHDOG and sonar_unhealthy:
+            # Enter immediately from any state: safety beats responsiveness here.
+            print(f"[WATCHDOG CRITICAL] Sensor feed compromised "
+                  f"(pigpio_fault={pigpio_fault}, elapsed {time_since_last_valid_read:.1f}s, "
+                  f"drops {drops_count}). Entering failsafe.", flush=True)
+            current_state = STATE_WATCHDOG
+            gate.enter(now)
         elif current_state == STATE_WATCHDOG:
-            print("[WATCHDOG RESOLVED] Heartbeat restored. Returning to STANDBY.", flush=True)
-            current_state = STATE_STANDBY
-            standby_ticks_start = time.time()
+            # Recovery is sticky: leave only after the sonar has stayed healthy
+            # for WATCHDOG_RECOVER_HOLD_S AND we've held WATCHDOG for the min
+            # dwell. This stops a marginal sonar from flapping WATCHDOG<->ACTIVE.
+            if sonar_unhealthy:
+                gate.clear()
+            elif gate.request(STATE_STANDBY, now, WATCHDOG_RECOVER_HOLD_S, WATCHDOG_MIN_DWELL_S):
+                print("[WATCHDOG RESOLVED] Heartbeat restored. Returning to STANDBY.", flush=True)
+                current_state = STATE_STANDBY
+                standby_start = now
+                gate.enter(now)
 
         # -----------------------------------------------------------------
-        # STEP B: EXTRACT MUTEX-LOCKED TELEMETRY & PRE-CALCULATE CONDITIONS
+        # STEP B: READ SENSOR STATE + COMPUTE PRESENCE
         # -----------------------------------------------------------------
         with state_mutex:
             pir = shared_state["pir"]
             distance = shared_state["distance"]
             is_dark = shared_state["is_dark"]
             last_motion = shared_state["last_motion_epoch"]
-            
-        # Presence fusion (Flap-B): keep presence alive if ANY signal fires.
-        # quiet_for then drives the two-stage wind-down: grace -> cheap ACTIVE-LO,
-        # timeout -> SLEEP.
-        now = time.time()
-        last_presence_epoch = max(last_presence_epoch, last_motion)   # PIR motion
+
+        # Presence stays alive if ANY signal fires: PIR motion, a close sonar
+        # reading, or a recent vision person-detection. quiet_for then drives the
+        # two-stage wind-down (grace -> cheap LO, timeout -> SLEEP).
+        last_presence_epoch = max(last_presence_epoch, last_motion, last_person_epoch)
         if distance < PRESENCE_DISTANCE_CM:
-            last_presence_epoch = now                                 # something is close
-        if last_person_epoch > last_presence_epoch:
-            last_presence_epoch = last_person_epoch                   # vision saw a person
+            last_presence_epoch = now
         quiet_for    = now - last_presence_epoch
         winding_down = quiet_for > PRESENCE_GRACE_S      # quiet -> cheap LO wind-down
         absent       = quiet_for > PRESENCE_TIMEOUT_S    # quiet long enough -> SLEEP
 
         # -----------------------------------------------------------------
-        # STEP C: FSM STATE TRANSITION HANDLING MATRIX
+        # STEP C: FSM TRANSITIONS (every debounced edge goes through the gate)
         # -----------------------------------------------------------------
         if current_state == STATE_SLEEP:
-            # Wake condition: any new PIR movement OR target steps inside the 350cm boundary
-            if pir == 1 or distance < 350.0:
+            # Wake on sustained motion or a target stepping inside WAKE_DISTANCE_CM.
+            # The gate's hold requirement filters single stray PIR pulses / blips.
+            wake_signal = (pir == 1) or (distance < WAKE_DISTANCE_CM)
+            if wake_signal and gate.request(STATE_STANDBY, now, WAKE_HOLD_S, dwell_s=0.0):
                 current_state = STATE_STANDBY
-                standby_ticks_start = time.time()  # Start the 200 ms warmup timer hook
-                print(f"[FSM TRANSITION] SLEEP -> STANDBY. Initiating warmup tick.", flush=True)
+                standby_start = now
+                gate.enter(now)
+                print("[FSM] SLEEP -> STANDBY. Wake confirmed.", flush=True)
+            elif not wake_signal:
+                gate.clear()
 
         elif current_state == STATE_STANDBY:
-            # Hold transient state for exactly one 200 ms execution window tick
-            if (time.time() - standby_ticks_start) >= 0.200:
-                if distance < 120.0:
-                    current_state = STATE_ACTIVE_LO
-                elif distance >= 160.0:
-                    current_state = STATE_ACTIVE_HI
-                else:
-                    current_state = STATE_ACTIVE_HI  # Default to high-res mode inside overlap zone
-                print(f"[FSM TRANSITION] STANDBY -> {current_state} based on target distance: {distance:.1f}cm", flush=True)
+            # Brief warmup, then pick the model from the current distance.
+            if now - standby_start >= STANDBY_WARMUP_S:
+                current_state = STATE_ACTIVE_LO if distance < HILO_CLOSE_CM else STATE_ACTIVE_HI
+                gate.enter(now)
+                print(f"[FSM] STANDBY -> {current_state} (distance {distance:.1f}cm).", flush=True)
 
         elif current_state == STATE_ACTIVE_LO:
             if absent:
+                # Vacancy confirmed by the 12s presence timeout (already debounced).
                 current_state = STATE_SLEEP
-                print("[FSM TRANSITION] ACTIVE-LO -> SLEEP. Target vacancy confirmed.", flush=True)
+                gate.enter(now)
+                print("[FSM] ACTIVE-LO -> SLEEP. Vacancy confirmed.", flush=True)
             elif winding_down:
-                # Presence signals quiet: hold cheap LO as the low-power wind-down
-                # and do NOT escalate to HI while counting down to SLEEP.
-                _hilo_reset()
-            elif distance > 160.0:  # present + far -> high-res; debounced (A1+A2)
-                if _hilo_confirmed(STATE_ACTIVE_HI):
+                # Presence quiet: hold cheap LO as the wind-down; do not escalate.
+                gate.clear()
+            elif distance > HILO_FAR_CM:
+                # Present + far -> high-res, debounced by the gate.
+                if gate.request(STATE_ACTIVE_HI, now, HILO_HOLD_S, HILO_DWELL_S):
                     current_state = STATE_ACTIVE_HI
-                    print(f"[FSM TRANSITION] ACTIVE-LO -> ACTIVE-HI. Target exited close-zone threshold (> 160cm).", flush=True)
-            else:  # crossing condition lapsed -> drop any partial confirmation
-                _hilo_reset()
+                    gate.enter(now)
+                    print("[FSM] ACTIVE-LO -> ACTIVE-HI. Target moved past far threshold.", flush=True)
+            else:
+                gate.clear()   # crossing condition lapsed -> drop partial confirmation
 
         elif current_state == STATE_ACTIVE_HI:
             if winding_down:
-                # Presence signals quiet: drop to cheap LO for the wind-down
-                # countdown instead of burning HI inference right up to SLEEP.
+                # Presence quiet: drop to cheap LO for the wind-down countdown
+                # instead of burning HI inference right up to SLEEP.
                 current_state = STATE_ACTIVE_LO
-                print("[FSM TRANSITION] ACTIVE-HI -> ACTIVE-LO. Presence quiet; low-power wind-down before sleep.", flush=True)
-            elif distance < 120.0:  # present + close -> low-res; debounced (A1+A2)
-                if _hilo_confirmed(STATE_ACTIVE_LO):
+                gate.enter(now)
+                print("[FSM] ACTIVE-HI -> ACTIVE-LO. Presence quiet; low-power wind-down.", flush=True)
+            elif distance < HILO_CLOSE_CM:
+                # Present + close -> low-res, debounced by the gate.
+                if gate.request(STATE_ACTIVE_LO, now, HILO_HOLD_S, HILO_DWELL_S):
                     current_state = STATE_ACTIVE_LO
-                    print(f"[FSM TRANSITION] ACTIVE-HI -> ACTIVE-LO. Target entered close-zone threshold (< 120cm).", flush=True)
-            else:  # crossing condition lapsed -> drop any partial confirmation
-                _hilo_reset()
+                    gate.enter(now)
+                    print("[FSM] ACTIVE-HI -> ACTIVE-LO. Target moved inside close threshold.", flush=True)
+            else:
+                gate.clear()   # crossing condition lapsed -> drop partial confirmation
 
         # -----------------------------------------------------------------
-        # STEP D: ORTHOGONAL LDR PREPROCESSING GATE EVALUATION
+        # STEP D: LOW-LIGHT PREPROCESSING GATE
         # -----------------------------------------------------------------
-        # The LM393 comparator supplies a clean digital dark/bright signal; its
-        # onboard potentiometer threshold and built-in comparator hysteresis now
-        # replace the former software dead-band entirely.
-        if current_state == STATE_WATCHDOG:
-            clahe_active = True  # Watchdog assumes worst-case low light automatically
-        else:
-            clahe_active = is_dark
+        # The LM393 comparator gives a clean digital dark/bright signal; its
+        # onboard pot threshold and built-in hysteresis replace any software
+        # dead-band. WATCHDOG assumes worst-case low light.
+        clahe_active = True if current_state == STATE_WATCHDOG else is_dark
 
         # -----------------------------------------------------------------
-        # STEP E: OUTPUT PROFILE EXECUTION BASED ON CURRENT DRIVING STATE
+        # STEP E: EXECUTE THE CURRENT STATE
         # -----------------------------------------------------------------
-        # Handle non-inference states (SLEEP & STANDBY) to maximize power savings
-        if current_state in [STATE_SLEEP, STATE_STANDBY]:
+        # SLEEP and STANDBY do no inference; emit an idle record and pace down.
+        if current_state in (STATE_SLEEP, STATE_STANDBY):
             cpu_pct, cpu_c = get_pi_hardware_metrics()
             idle_record = {
                 "ts": time.strftime("%H:%M:%S"),
                 "state": current_state,
-                "model_res": None,        # no inference in this state
+                "model_res": None,
                 "latency_ms": None,
                 "cpu_pct": cpu_pct,
                 "cpu_temp_c": cpu_c,
@@ -589,49 +633,42 @@ def adaptive_vision_streamer():
                 "detections": [],
             }
             emit_telemetry(idle_record)
-
             if ENABLE_GUI and show_gui(_idle_frame(), idle_record, [], []) == "quit":
                 break
-
-            # Pacing adjustment: deep sleep if sleeping, rapid loop if warming up
-            time.sleep(1.0 if current_state == STATE_SLEEP else 0.05)
+            # SLEEP paces at 0.5s: slow enough to save power, fast enough for the
+            # gate's wake hold to confirm a genuine signal within ~1s. STANDBY
+            # spins fast to clear the brief warmup.
+            time.sleep(0.5 if current_state == STATE_SLEEP else 0.05)
             continue
 
-        # Inference Processing States (ACTIVE-LO, ACTIVE-HI, WATCHDOG)
+        # Inference states: ACTIVE-LO, ACTIVE-HI, WATCHDOG.
         success, raw_frame = camera_feed.read()
         if not success or raw_frame is None:
             continue
 
-        # Apply orthogonal image preprocessing layers if activated 
+        # Optional low-light enhancement (CLAHE on the luma channel).
         if clahe_active:
-            yuv_buffer = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2YUV)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-            yuv_buffer[:, :, 0] = clahe.apply(yuv_buffer[:, :, 0])
-            processed_frame = cv2.cvtColor(yuv_buffer, cv2.COLOR_YUV2BGR)
+            yuv = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2YUV)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            yuv[:, :, 0] = clahe.apply(yuv[:, :, 0])
+            processed_frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
         else:
             processed_frame = raw_frame
 
-        # Resolve resolution model, size constraints and pacing rates [cite: 358, 360]
+        # Select the model and loop pacing for the current state.
         if current_state == STATE_ACTIVE_LO:
-            detector = model_lo
-            img_inference_size = 320
-            loop_pacing_rate = 0.01  # Target close: run highly responsive loop pacing
+            detector, img_inference_size, loop_pacing_rate = model_lo, 320, 0.01   # close: highly responsive
         elif current_state == STATE_ACTIVE_HI:
-            detector = model_hi
-            img_inference_size = 640
-            loop_pacing_rate = 0.40  # Target far: slow down pacing to preserve resources
+            detector, img_inference_size, loop_pacing_rate = model_hi, 640, 0.40   # far: slow to save resources
         else:  # STATE_WATCHDOG
-            detector = model_hi
-            img_inference_size = 640
-            loop_pacing_rate = 0.10  # Failsafe fallback loop pacing rate
+            detector, img_inference_size, loop_pacing_rate = model_hi, 640, 0.10   # failsafe fallback pace
 
-        # Run model inference and track math execution performance times
         start_inference = time.time()
         detected_classes, detected_confidences, detected_boxes = detector(processed_frame)
         inference_duration_ms = (time.time() - start_inference) * 1000.0
 
-        # Flap-B vision vote: a detected person refreshes presence directly, so a
-        # motionless-but-visible occupant keeps the node awake even with no PIR.
+        # Vision presence vote: a detected person keeps the node awake even with
+        # no PIR motion (a motionless-but-visible occupant).
         if PERSON_CLASS_ID in detected_classes:
             last_person_epoch = time.time()
 
@@ -641,7 +678,7 @@ def adaptive_vision_streamer():
         active_record = {
             "ts": time.strftime("%H:%M:%S"),
             "state": current_state,
-            "model_res": img_inference_size,   # 320 (ACTIVE-LO) or 640 (ACTIVE-HI / WATCHDOG)
+            "model_res": img_inference_size,
             "latency_ms": inference_duration_ms,
             "cpu_pct": cpu_pct,
             "cpu_temp_c": cpu_c,
@@ -657,7 +694,7 @@ def adaptive_vision_streamer():
 
         time.sleep(loop_pacing_rate)
 
-    # GUI quit ('q') -> tidy up and signal the main thread to exit
+    # GUI quit ('q') -> tidy up and signal the main thread to exit.
     camera_feed.release()
     if ENABLE_GUI:
         cv2.destroyAllWindows()
@@ -671,8 +708,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     ENABLE_GUI = not args.headless
 
-    print(f"[INIT] Launching 5-State Adaptive Video Edge Node Framework "
-          f"(GUI {'enabled' if ENABLE_GUI else 'disabled'})...", flush=True)
+    print(f"[INIT] Launching SAGE-Vision edge node (GUI {'enabled' if ENABLE_GUI else 'disabled'})...", flush=True)
     harvester_thread = threading.Thread(target=gpio_harvester_worker, daemon=True)
     vision_thread = threading.Thread(target=adaptive_vision_streamer, daemon=True)
 
