@@ -54,13 +54,33 @@ def get_pi_hardware_metrics():
     return psutil.cpu_percent(interval=None), cpu_temp
 
 
-def read_power_w():
-    """STUB: whole-Pi power draw in watts from the INA260 (I2C).
+# INA219 power monitor — mirrors pi_edge_node.read_power_w() so the baseline and
+# adaptive energy logs share the same column and the same calibration. Lazily
+# initialised; returns None when the sensor is absent. See HARDWARE_CONNECTIONS.md.
+INA219_SHUNT_OHMS = 0.1
+INA219_MAX_AMPS = 3.2
+_ina219 = None
+_ina219_unavailable = False
 
-    Returns None until the sensor is wired in. Mirrors the adaptive node so the
-    baseline and adaptive energy logs share the same column.
-    """
-    return None
+
+def read_power_w():
+    """Whole-Pi power draw in watts from the INA219 over I2C (None if absent)."""
+    global _ina219, _ina219_unavailable
+    if _ina219_unavailable:
+        return None
+    if _ina219 is None:
+        try:
+            from ina219 import INA219
+            _ina219 = INA219(INA219_SHUNT_OHMS, INA219_MAX_AMPS)
+            _ina219.configure(_ina219.RANGE_16V, _ina219.GAIN_8_320MV)
+        except Exception as exc:
+            print(f"[PWR] INA219 unavailable ({exc}); power telemetry disabled.", flush=True)
+            _ina219_unavailable = True
+            return None
+    try:
+        return _ina219.power() / 1000.0    # pi-ina219 returns milliwatts
+    except Exception:
+        return None
 
 
 def build_detection_pairs(class_ids, confidences):

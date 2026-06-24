@@ -24,7 +24,7 @@ The system is **self-contained on the Raspberry Pi**. Sensors wire directly to i
    │  LM393 light     DO  ── GPIO 27        │
    │  HC-SR04  TRIG ── GPIO 23              │
    │           ECHO ── GPIO 24 (divider)    │
-   │  INA260 power    SDA/SCL ── I2C (opt.) │
+   │  INA219 power    SDA/SCL ── I2C (opt.) │
    └────────────────────┬───────────────────┘
                         ▼
 ┌──────────────────────────────┐
@@ -57,7 +57,7 @@ The system is **self-contained on the Raspberry Pi**. Sensors wire directly to i
 
 ### Why This Topology
 
-The Raspberry Pi reads the sensors directly off its GPIO header through the `pigpio` daemon, which captures the HC-SR04 echo edges with hardware timestamps in its own real-time thread — the equivalent of a microcontroller ISR, but without a second board or a serial link to keep in sync. Sensor sampling lives on a thread pinned to Core 1; all inference, adaptive decision-making, and the demo GUI run on a separate thread pinned to Cores 2 & 3. Telemetry is printed to the Pi's own terminal, so the whole system runs **fully offline** (an optional cloud sink and an INA260 power reading are stubbed in `pi_edge_node.py` for later).
+The Raspberry Pi reads the sensors directly off its GPIO header through the `pigpio` daemon, which captures the HC-SR04 echo edges with hardware timestamps in its own real-time thread — the equivalent of a microcontroller ISR, but without a second board or a serial link to keep in sync. Sensor sampling lives on a thread pinned to Core 1; all inference, adaptive decision-making, and the demo GUI run on a separate thread pinned to Cores 2 & 3. Telemetry is printed to the Pi's own terminal, so the whole system runs **fully offline** (the `power_w` column reads the optional INA219 over I2C, and a cloud sink is stubbed in `pi_edge_node.py` for later).
 
 The two on-Pi threads communicate only through a mutex-guarded latest-value snapshot, so a slow inference frame can never starve the sensor reader — and reading sensors directly on the Pi removes the ESP32, the serial link, and the whole class of serial-framing and buffer-overflow failure modes that came with them.
 
@@ -141,12 +141,11 @@ Each loop the vision thread assembles **one telemetry record** (a dict) and fans
 | `model_res` | Inference resolution / model used: `320`, `640`, or `---` when idle |
 | `latency_ms` | Per-frame inference duration |
 | `cpu_pct`, `cpu_temp_c` | CPU utilisation % and core temperature °C |
-| `power_w` | Whole-Pi power draw (INA260 over I2C — `-- W` until the sensor is wired) |
+| `power_w` | Whole-Pi power draw (INA219 over I2C — `-- W` until the sensor is wired) |
 | `distance_cm` | Median ultrasonic distance |
 | `detections` | List of `(label, confidence%)` — **all** detections, not capped |
 
-The only active sink today is the **terminal sink** (`_terminal_sink`), which prints one line per loop to the Pi's own console — the system runs fully offline. Two sinks are stubbed for later, both designed to be non-blocking so they never stall the FSM:
-- `read_power_w()` — read the INA260 and fill the `power_w` column.
+The only active sink today is the **terminal sink** (`_terminal_sink`), which prints one line per loop to the Pi's own console — the system runs fully offline. The `power_w` column is filled by `read_power_w()`, which reads the optional INA219 over I2C (`-- W` until the sensor is wired — see `HARDWARE_CONNECTIONS.md` §4). One sink is stubbed for later, designed to be non-blocking so it never stalls the FSM:
 - `_cloud_sink()` — push records to a cloud platform (one line to enable in `emit_telemetry`).
 
 Sample terminal line:

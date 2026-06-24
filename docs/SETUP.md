@@ -15,7 +15,7 @@ This document covers everything from flashing the OS to running the live pipelin
   - LM393 light comparator module — DO → **GPIO 27** (powered from 3.3V)
   - HC-SR501 PIR Motion Sensor — OUT → **GPIO 17**
   - HC-SR04 Ultrasonic Sensor — Trigger → **GPIO 23**, Echo → **GPIO 24** *(via 1 kΩ / 2 kΩ voltage divider to step the 5V echo line down to 3.3V)*
-  - *(Optional, for power telemetry)* INA260 power monitor on the Pi's 5V rail over I2C
+  - *(Optional, for power telemetry)* INA219 power monitor inline on the Pi's 5V USB-C feed over I2C
 
 > The sensors connect to the Pi directly — there is **no ESP32 in the live pipeline**. The original ESP32 firmware is retained under `firmware/` as legacy only; Phase 2 below is optional and not required to run the system. The system runs **fully offline on the Pi alone** — no second machine is involved in live operation.
 

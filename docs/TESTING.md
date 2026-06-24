@@ -10,7 +10,7 @@ Both the baseline and the adaptive node run **entirely on the Pi** and print tel
 
 The experiment is designed to produce empirical evidence for these claims:
 
-1. **Energy reduction** — the adaptive system draws less average power, and fewer Joules per confirmed detection, over a realistic occupancy pattern. *(Requires the optional INA260; see `HARDWARE_CONNECTIONS.md`.)*
+1. **Energy reduction** — the adaptive system draws less average power, and fewer Joules per confirmed detection, over a realistic occupancy pattern. *(Requires the optional INA219; see `HARDWARE_CONNECTIONS.md`.)*
 2. **CPU reduction** — the adaptive system uses less processor time during idle and low-complexity states.
 3. **Thermal stabilisation** — the adaptive system keeps the BCM2711 SoC away from the 80°C throttling boundary.
 4. **Latency improvement** — dynamic resolution scaling reduces per-frame inference time when subjects are close.
@@ -33,7 +33,7 @@ Two runs are compared:
 - [ ] `pigpiod` running (`sudo systemctl enable --now pigpiod`)
 - [ ] USB web camera connected
 - [ ] Both `.tflite` models present in `rpi_edge/` (`yolov8n_320_int8.tflite`, `yolov8n_640_int8.tflite`)
-- [ ] *(For the energy claim)* INA260 wired inline on the Pi's 5 V rail, I²C enabled, and `read_power_w()` implemented in `pi_edge_node.py`
+- [ ] *(For the energy claim)* INA219 wired inline on the Pi's 5 V USB-C feed, I²C enabled (`i2cdetect -y 1` shows `0x40`), and `pi-ina219` installed
 - [ ] A **stopwatch** ready for the ground-truth log
 - [ ] A **physical notepad** for manual object annotations
 - [ ] Room at approximately **25°C ambient**
@@ -66,7 +66,7 @@ A captured line looks like:
 ```
 [14:22:07] ACTIVE-LO | model 320 | lat   28.4ms | cpu 47.0% | temp 58.1C | pwr  -- W | dist   95.3cm | dets: Student/Person(94.2%)
 ```
-The fields (`state`, `model`, `lat`, `cpu`, `temp`, `pwr`, `dist`, `dets`) are fixed-position and easy to parse later with `awk`/`grep` or a short Python script. `pwr` shows `-- W` until the INA260 is wired.
+The fields (`state`, `model`, `lat`, `cpu`, `temp`, `pwr`, `dist`, `dets`) are fixed-position and easy to parse later with `awk`/`grep` or a short Python script. `pwr` shows `-- W` until the INA219 is wired.
 
 ---
 
@@ -172,7 +172,7 @@ Press `Ctrl+C` (or `q` if you left the GUI on). Confirm `~/run_adaptive.log` cap
 
 There is no automated plotting script in the repo (the old `plot_comparison.py` / CSV pipeline was removed). Analyse the two captured logs directly — a short Python/`awk` parser over the fixed-position fields is enough. Suggested comparisons, mapped to the objectives:
 
-- **Energy (obj. 1):** average `pwr` over each run, and Joules per detection = (mean watts × run seconds) / (number of confirmed detections). Compare baseline vs adaptive over the same schedule. *(Needs INA260.)*
+- **Energy (obj. 1):** average `pwr` over each run, and Joules per detection = (mean watts × run seconds) / (number of confirmed detections). Compare baseline vs adaptive over the same schedule. *(Needs INA219.)*
 - **CPU (obj. 2):** mean/percentiles of the `cpu` column.
 - **Thermal (obj. 3):** plot `temp` vs elapsed time; the baseline should climb toward 80°C while the adaptive curve flattens lower.
 - **Latency (obj. 4):** distribution of `lat` per `state`; the adaptive `ACTIVE-LO` (320) frames should be markedly faster than baseline 640.

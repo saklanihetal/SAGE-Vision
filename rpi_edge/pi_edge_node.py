@@ -185,9 +185,10 @@ def get_pi_hardware_metrics():
 # =========================================================================
 # One telemetry record (dict) is assembled per loop and fanned out to sinks.
 # The terminal sink prints to the Pi's own console (the node runs fully offline).
-# read_power_w() and _cloud_sink() are intentional stubs filled in later:
-#   - read_power_w(): INA260 over I2C -> whole-Pi 5V rail power draw (watts)
-#   - _cloud_sink():  non-blocking uploader once the cloud platform is chosen
+# read_power_w() reads the INA219 (I2C) for whole-Pi 5V-rail power draw (watts);
+# it returns None when the sensor is absent so the node still runs headless.
+# _cloud_sink() is an intentional stub: a non-blocking uploader once the cloud
+# platform is chosen.
 
 # YOLOv8 COCO 80-class map (dense indices 0-79, not the sparse 91-class paper IDs).
 COCO_LABELS = {
@@ -210,13 +211,43 @@ COCO_LABELS = {
 }
 
 
-def read_power_w():
-    """STUB: whole-Pi power draw in watts from the INA260 (I2C).
+# INA219 power monitor — optional. Lazily initialised on the first read so the
+# node runs fine when the sensor is absent (read_power_w() returns None and the
+# telemetry "pwr" column shows "-- W"). See docs/HARDWARE_CONNECTIONS.md Section 4.
+INA219_SHUNT_OHMS = 0.1      # on-board shunt on the GY-219 / Adafruit INA219
+INA219_MAX_AMPS = 3.2        # 320 mV gain over 0.1 Ohm; covers the Pi 4B's peak draw
+_ina219 = None
+_ina219_unavailable = False
 
-    Returns None until the sensor is wired in. To enable, read the INA260 here
-    (e.g. adafruit_ina260) and return its .power value converted to watts.
+
+def read_power_w():
+    """Whole-Pi power draw in watts from the INA219 over I2C.
+
+    The INA219 sits high-side, inline on the Pi's incoming 5 V USB-C feed (see
+    docs/HARDWARE_CONNECTIONS.md, Section 4), so its power register is the total
+    power delivered to the Pi. Returns watts, or None if the sensor is not
+    wired / not responding so telemetry degrades gracefully to "-- W".
     """
-    return None
+    global _ina219, _ina219_unavailable
+    if _ina219_unavailable:
+        return None
+    if _ina219 is None:
+        try:
+            from ina219 import INA219
+            _ina219 = INA219(INA219_SHUNT_OHMS, INA219_MAX_AMPS)
+            # 16 V range (the Pi runs at 5 V) + 320 mV gain -> up to 3.2 A at the
+            # finest resolution that still spans the Pi's peak draw.
+            _ina219.configure(_ina219.RANGE_16V, _ina219.GAIN_8_320MV)
+        except Exception as exc:
+            print(f"[PWR] INA219 unavailable ({exc}); power telemetry disabled.", flush=True)
+            _ina219_unavailable = True
+            return None
+    try:
+        return _ina219.power() / 1000.0    # pi-ina219 returns milliwatts
+    except Exception:
+        # e.g. a transient I2C glitch or DeviceRangeError on a current spike;
+        # drop just this sample rather than killing telemetry.
+        return None
 
 
 def build_detection_pairs(class_ids, confidences):

@@ -28,6 +28,12 @@ opencv-python>=4.8.0,<4.10.0
 
 psutil>=5.9.0
 
+# INA219 power monitor (optional). Only needed if the inline power-telemetry rig
+# from docs/HARDWARE_CONNECTIONS.md Section 4 is wired; the node runs without it
+# (the power column shows "-- W"). Pure-Python over smbus2 — no Blinka /
+# CircuitPython stack required. Requires I2C enabled (sudo raspi-config).
+pi-ina219>=1.4.0
+
 # opencv-python (the GUI build) is required for the on-Pi demo window. For a
 # remote / no-monitor deployment, run the node with `--headless` and you may
 # instead install the lighter `opencv-python-headless` (no Qt/GUI deps) — apply
