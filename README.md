@@ -9,7 +9,7 @@ A Raspberry Pi 4B edge application that uses PIR, light (LDR), and ultrasonic se
 
 Running a continuous, fixed-resolution computer-vision loop on an ARM SoC like the Raspberry Pi 4B is thermally and energetically expensive — it pushes the Broadcom BCM2711 toward its 80 °C throttling boundary within minutes, even though most of the time the scene is empty or static. The usual fixes (a heatsink, an AI-accelerator hat, or a weaker model) either add hardware cost or sacrifice accuracy.
 
-SAGE-Vision makes **compute proportional to scene demand**: cheap sensors gate *when* and *how hard* the YOLO model runs, so the node idles near-free when nothing is happening and scales inference resolution to subject distance when it is. The target is a measurable reduction in average power, CPU utilisation, and core temperature versus an always-on baseline, with no meaningful loss in detection quality — at zero additional hardware cost beyond sensors already on the bench.
+SAGE-Vision makes **compute proportional to scene demand**: cheap sensors gate *when* and *how hard* the YOLO model runs, so the node idles near-free when nothing is happening and scales inference resolution to subject distance when it is. The target is a measurable reduction in **average power draw and core temperature** versus an always-on baseline, with no meaningful loss in detection quality — at zero additional hardware cost beyond sensors already on the bench.
 
 ---
 
@@ -265,3 +265,11 @@ SAGE-Vision/
 | Two fixed-resolution INT8 models | Full-integer export bakes input size; switching models is the adaptive resolution |
 | INT8 TFLite over FP32 PyTorch | 2–4× lower inference time on ARM Neon; no GPU required |
 | CLAHE on luma over global brightness | Preserves local contrast for detection; global boost washes out fine edges |
+
+---
+
+## License
+
+This project's source code is released under the [MIT License](LICENSE) — you're free to use, modify, and distribute it with attribution.
+
+> **Note on the model weights:** the bundled `yolov8n_*_int8.tflite` files are derived from [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics), which is licensed **AGPL-3.0**. The MIT license above covers this project's own code; redistributing or deploying the YOLOv8-derived weights may carry AGPL-3.0 obligations. For non-AGPL use, see Ultralytics' commercial licensing.
