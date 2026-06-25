@@ -3,6 +3,7 @@ import sys
 import time
 import argparse
 import threading
+import queue
 import urllib.request
 import urllib.parse
 import cv2
@@ -301,6 +302,7 @@ def cloud_uploader_worker():
     record to ThingSpeak. None-valued metrics are omitted (ThingSpeak leaves
     that field unchanged); network failures are logged and swallowed so the
     node keeps running offline-first."""
+    os.sched_setaffinity(0, {0})   # keep off the sensor (1) and inference (2,3) cores
     print(f"[CLOUD] ThingSpeak uploader started ({CLOUD_INTERVAL_S:.0f}s interval).", flush=True)
     while not shutdown_event.wait(CLOUD_INTERVAL_S):   # also wakes on shutdown
         with _latest_record_lock:
@@ -417,6 +419,89 @@ def show_gui(video, record, boxes, detection_pairs):
         cv2.setWindowProperty(WINDOW_NAME, cv2.WND_PROP_FULLSCREEN,
                               cv2.WINDOW_FULLSCREEN if _fullscreen else cv2.WINDOW_NORMAL)
     return None
+
+
+# =========================================================================
+# DETECTION SNAPSHOTS (optional — enabled with --snapshots, local-only)
+# =========================================================================
+# When a class of interest is detected, the frame is saved to disk as JPEG
+# evidence. To honour the "sinks never stall the FSM" rule, the vision thread
+# only copies the frame + meta onto a bounded queue; snapshot_worker does the
+# JPEG encode and the disk write. A ring buffer caps the folder so the SD card
+# can't fill. No network — files live in ./snapshots/ at the repo root.
+# At 640x480 / quality 85 a JPEG is ~50 KB, so 500 files is ~25 MB.
+SNAPSHOT_DIR = os.path.join(os.path.dirname(_here), "snapshots")  # _here = rpi_edge/
+SNAPSHOT_CLASSES = {PERSON_CLASS_ID}   # COCO ids that trigger a capture
+SNAPSHOT_CONF = 0.60                   # ignore detections weaker than this (raw 0-1)
+SNAPSHOT_COOLDOWN_S = 30.0             # min seconds between snapshots (one per episode)
+SNAPSHOT_MAX_FILES = 500               # ring-buffer cap; oldest JPEGs deleted past this
+SNAPSHOT_QUEUE_MAX = 8                 # bounded queue; drop-oldest if the writer lags
+SNAPSHOT_JPEG_QUALITY = 85
+ENABLE_SNAPSHOTS = False               # overridden by the --snapshots CLI flag
+
+_snapshot_queue = queue.Queue(maxsize=SNAPSHOT_QUEUE_MAX)
+_last_snapshot_epoch = 0.0
+
+
+def maybe_queue_snapshot(frame, class_ids, confidences, pairs, record):
+    """Vision-thread side (must stay cheap): cooldown-gate the capture, and if it
+    fires, copy the frame + meta onto the queue. The worker does the encode/IO."""
+    global _last_snapshot_epoch
+    now = time.time()
+    if now - _last_snapshot_epoch < SNAPSHOT_COOLDOWN_S:
+        return
+    best = None   # highest-confidence qualifying detection -> drives the filename
+    for cid, conf, pair in zip(class_ids, confidences, pairs):
+        if cid in SNAPSHOT_CLASSES and conf >= SNAPSHOT_CONF and (best is None or conf > best[0]):
+            best = (conf, pair)
+    if best is None:
+        return
+    _last_snapshot_epoch = now
+    item = {"frame": frame.copy(),    # mandatory: OpenCV reuses the capture buffer
+            "record": record, "top": best[1], "epoch": now}
+    try:
+        _snapshot_queue.put_nowait(item)
+    except queue.Full:
+        try:                          # drop-oldest, then enqueue the newest
+            _snapshot_queue.get_nowait()
+            _snapshot_queue.put_nowait(item)
+        except (queue.Empty, queue.Full):
+            pass
+
+
+def snapshot_worker():
+    """Worker thread: drain the queue, write each frame to SNAPSHOT_DIR as a JPEG
+    (the filename carries ts/class/conf/state), and enforce the ring-buffer cap.
+    Failures are logged and skipped; all encoding/IO is off the vision thread."""
+    os.sched_setaffinity(0, {0})   # keep the JPEG-encode burst off cores 1/2/3
+    os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+    print(f"[SNAP] snapshot writer started -> {SNAPSHOT_DIR}", flush=True)
+    while not shutdown_event.is_set():
+        try:
+            item = _snapshot_queue.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        try:
+            (label, conf), t = item["top"], item["epoch"]
+            stamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(t)) + f"-{int(t * 1000) % 1000:03d}"
+            safe = label.split("/")[0].replace(" ", "")   # "Student/Person" -> "Student"
+            fname = f"{stamp}_{safe}_{conf:.0f}_{item['record']['state']}.jpg"
+
+            ok, buf = cv2.imencode(".jpg", item["frame"], [cv2.IMWRITE_JPEG_QUALITY, SNAPSHOT_JPEG_QUALITY])
+            if not ok:
+                raise RuntimeError("cv2.imencode failed")
+            with open(os.path.join(SNAPSHOT_DIR, fname), "wb") as f:
+                f.write(buf.tobytes())
+
+            jpgs = sorted((e.path for e in os.scandir(SNAPSHOT_DIR) if e.name.endswith(".jpg")),
+                          key=os.path.getmtime)
+            for old in jpgs[:max(0, len(jpgs) - SNAPSHOT_MAX_FILES)]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+        except Exception as exc:
+            print(f"[SNAP] write failed ({exc}); skipping.", flush=True)
 
 
 # =========================================================================
@@ -742,9 +827,28 @@ def adaptive_vision_streamer():
         if not success or raw_frame is None:
             continue
 
-        # Optional low-light enhancement (CLAHE on the luma channel).
+        # Optional low-light enhancement: CLAHE on the luma (Y) channel only, so
+        # contrast is lifted without shifting colour (equalising R/G/B separately
+        # would distort hue). Convert BGR->YUV, equalise Y, convert back.
         if clahe_active:
             yuv = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2YUV)
+            # tileGridSize=(8,8): split the frame into an 8x8 grid (64 tiles) and
+            #   equalise each tile against its OWN local histogram, so a dark
+            #   corner is boosted independently of a bright region (results are
+            #   bilinearly interpolated across tiles to avoid blocky seams). 8x8
+            #   is the standard default: small enough to adapt locally, large
+            #   enough that each tile still has meaningful histogram statistics.
+            # clipLimit=2.0: contrast cap. The histogram has 256 bins (8-bit Y).
+            #   OpenCV clips each bin at clipLimit * (tile_pixels / 256) = 2x the
+            #   average bin height, then redistributes the clipped excess. This
+            #   bounds the slope of the equalisation curve, which is what stops
+            #   near-flat dark regions from massively amplifying sensor noise.
+            #   Worked example (only valid if the camera actually delivers the
+            #   640x480 requested above -- .set() is a request, not a guarantee):
+            #   640*480 = 307,200 px / 64 tiles = 4,800 px/tile; 4,800 / 256 bins
+            #   ~= 19 px average bin height; clip at 2.0x ~= 38 px per bin. 2.0 is
+            #   a deliberately mild value (raise toward 4-5 for punchier, noisier
+            #   output); the absolute 38 px scales with the real frame size.
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             yuv[:, :, 0] = clahe.apply(yuv[:, :, 0])
             processed_frame = cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR)
@@ -784,6 +888,9 @@ def adaptive_vision_streamer():
             "detections": detection_pairs,
         }
         emit_telemetry(active_record)
+        if ENABLE_SNAPSHOTS:
+            maybe_queue_snapshot(processed_frame, detected_classes, detected_confidences,
+                                 detection_pairs, active_record)
 
         if ENABLE_GUI and show_gui(processed_frame, active_record, detected_boxes, detection_pairs) == "quit":
             break
@@ -803,9 +910,12 @@ if __name__ == "__main__":
                         help="run without the on-Pi GUI window (remote / no-monitor deployment)")
     parser.add_argument("--cloud", action="store_true",
                         help="stream telemetry (power, latency, CPU temp, distance) to ThingSpeak every 20s")
+    parser.add_argument("--snapshots", action="store_true",
+                        help="save a JPEG to ./snapshots/ when a person is detected (ring-buffered, local-only)")
     args = parser.parse_args()
     ENABLE_GUI = not args.headless
     ENABLE_CLOUD = args.cloud
+    ENABLE_SNAPSHOTS = args.snapshots
     if ENABLE_CLOUD and not THINGSPEAK_WRITE_KEY:
         print("[CLOUD] --cloud set but THINGSPEAK_API_KEY is empty (check rpi_edge/.env); "
               "cloud upload disabled.", flush=True)
@@ -813,7 +923,8 @@ if __name__ == "__main__":
 
     print(f"[INIT] Launching SAGE-Vision edge node "
           f"(GUI {'enabled' if ENABLE_GUI else 'disabled'}, "
-          f"cloud {'enabled' if ENABLE_CLOUD else 'disabled'})...", flush=True)
+          f"cloud {'enabled' if ENABLE_CLOUD else 'disabled'}, "
+          f"snapshots {'enabled' if ENABLE_SNAPSHOTS else 'disabled'})...", flush=True)
     harvester_thread = threading.Thread(target=gpio_harvester_worker, daemon=True)
     vision_thread = threading.Thread(target=adaptive_vision_streamer, daemon=True)
 
@@ -821,6 +932,8 @@ if __name__ == "__main__":
     vision_thread.start()
     if ENABLE_CLOUD:
         threading.Thread(target=cloud_uploader_worker, daemon=True).start()
+    if ENABLE_SNAPSHOTS:
+        threading.Thread(target=snapshot_worker, daemon=True).start()
 
     try:
         shutdown_event.wait()

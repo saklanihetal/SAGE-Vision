@@ -12,6 +12,9 @@ datasets/
 *.pt
 *.onnx
 
+# Detection snapshots (runtime evidence captures — not source)
+snapshots/
+
 # Secrets (never commit API keys) — keep .env.example committed as a template
 .env
 **/.env
