@@ -15,7 +15,7 @@ SAGE-Vision makes **compute proportional to scene demand**: cheap sensors gate *
 
 ## System Overview
 
-![SAGE-Vision system architecture](docs/images/system-architecture.png)
+<img width="1536" height="950" alt="System Architecture" src="https://github.com/user-attachments/assets/e013ed95-f943-4051-b0da-51b809678421" />
 
 The node runs **fully offline on the Pi alone**. Sensors wire directly to the 40-pin GPIO header (read by the `pigpio` background process — there is no microcontroller in the live path); a USB camera supplies frames; a two-thread core (sensor harvester + adaptive vision/FSM) does the work, with optional background threads for power/telemetry. Inference runs on `tflite-runtime` with INT8 YOLOv8-nano models.
 
@@ -86,7 +86,7 @@ The vision vote is essential because **PIR senses motion, not presence** — a m
 
 Inference is controlled through a 5-state finite state machine.
 
-![5-state FSM](docs/images/fsm.png)
+<img width="1619" height="972" alt="5 state FSM" src="https://github.com/user-attachments/assets/f852ccb6-f5ae-4b7d-8592-cd0f8cd3200a" />
 
 1. **SLEEP** — no inference; the loop polls at ~0.5 s watching for a wake signal. Exits to **STANDBY** when the PIR fires or the ultrasonic detects an object within `WAKE_DISTANCE_CM` (~300 cm), held long enough to pass the debounce gate.
 2. **STANDBY** — a transitional state entered on waking; no inference. Polls fast (~0.05 s) to clear a brief warm-up (`STANDBY_WARMUP_S`, ~200 ms), then picks the active state by distance.
@@ -249,7 +249,6 @@ SAGE-Vision/
 - [docs/SETUP.md](docs/SETUP.md) — installation and execution (HDMI or VNC display), plus the optional `--cloud` setup.
 - [docs/HARDWARE_CONNECTIONS.md](docs/HARDWARE_CONNECTIONS.md) — full wiring for every sensor and the INA219 power rig.
 - [docs/TESTING.md](docs/TESTING.md) — benchmarking the adaptive node against the baseline.
-- [docs/ENGINEERING_LOG.md](docs/ENGINEERING_LOG.md) — the running record of problems, fixes, and tradeoffs.
 
 ---
 
