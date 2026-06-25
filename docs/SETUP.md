@@ -10,14 +10,14 @@ This document covers everything from flashing the OS to running the live pipelin
 - Raspberry Pi 4B (2 GB RAM minimum; 4 GB recommended)
 - MicroSD card (16 GB minimum, Class 10 / A1 rated)
 - USB Web Camera (UVC-compliant; plug-and-play, no drivers needed)
-- A **display for the demo GUI** — either a physical **HDMI monitor** (+ keyboard) or remote **VNC** from your computer (see Phase 5). *(Not needed if you run with `--headless`.)*
+- A **display for the demo GUI** — either a physical **HDMI monitor** (+ keyboard) or remote **VNC** from your computer (see Phase 4). *(Not needed if you run with `--headless`.)*
 - Sensors wired **directly to the Pi's 40-pin GPIO header** as documented in `HARDWARE_CONNECTIONS.md`:
   - LM393 light comparator module — DO → **GPIO 27** (powered from 3.3V)
   - HC-SR501 PIR Motion Sensor — OUT → **GPIO 17**
   - HC-SR04 Ultrasonic Sensor — Trigger → **GPIO 23**, Echo → **GPIO 24** *(via 1 kΩ / 2 kΩ voltage divider to step the 5V echo line down to 3.3V)*
   - *(Optional, for power telemetry)* INA219 power monitor inline on the Pi's 5V USB-C feed over I2C
 
-> The sensors connect to the Pi directly — there is **no ESP32 in the live pipeline**. The original ESP32 firmware is retained under `firmware/` as legacy only; Phase 2 below is optional and not required to run the system. The system runs **fully offline on the Pi alone** — no second machine is involved in live operation.
+> The sensors connect to the Pi directly — there is **no ESP32 in the live pipeline**. The original ESP32 firmware is retained under `firmware/` as legacy only and is not part of setup. The system runs **fully offline on the Pi alone** — no second machine is involved in live operation.
 
 ---
 
@@ -86,73 +86,7 @@ Accept the host fingerprint prompt (type `yes` and press Enter), then enter your
 
 ---
 
-## Phase 2: ESP32 Firmware Flash (RV-IoT Board) — LEGACY / OPTIONAL
-
-> **Skip this phase.** The current pipeline reads sensors directly on the Pi (Phase 3). These steps are retained only for anyone reviving the legacy ESP32-over-serial path.
-
-Do this **before** physically wiring the sensors to the board.
-
-### Step 1 — Install Arduino IDE
-
-Download **Arduino IDE 2.x** from `https://www.arduino.cc/en/software` and install it on your laptop.
-
-### Step 2 — Add the ESP32 Board Package
-
-1. Open Arduino IDE.
-2. Go to **File → Preferences** (macOS: **Arduino IDE → Settings**).
-3. In the *Additional Boards Manager URLs* field, add the following URL (append with a comma if other URLs already exist):
-   ```
-   https://dl.espressif.com/dl/package_esp32_index.json
-   ```
-4. Click **OK**.
-5. Go to **Tools → Board → Boards Manager**.
-6. Search for `esp32`, find the package by **Espressif Systems**, and click **Install**.
-
-### Step 3 — Connect the RV-IoT Board
-
-Connect the RV-IoT Board to your laptop using a **data-capable** Micro-USB cable. Charge-only cables will not work — the board will power up but the serial port will not appear.
-
-### Step 4 — Configure Upload Settings
-
-In Arduino IDE, set the following under the **Tools** menu:
-
-| Setting | Value |
-|---|---|
-| Board | ESP32 Dev Module |
-| Upload Speed | 921600 |
-| CPU Frequency | 240MHz (WiFi/BT) |
-| Flash Frequency | 80MHz |
-| Flash Mode | QIO |
-| Flash Size | 4MB (32Mb) |
-| Partition Scheme | Default 4MB with spiffs |
-| Port | See below |
-
-**Selecting the port:**
-
-- **Windows:** Look for `COM3`, `COM4`, or similar under **Tools → Port**. If multiple ports appear, unplug the board, note which ones remain, replug, and select the new one.
-- **macOS:** Look for `/dev/cu.usbserial-XXXX` or `/dev/cu.SLAB_USBtoUART`.
-- **Linux/Ubuntu:** Look for `/dev/ttyUSB0` or `/dev/ttyACM0`. If nothing appears, run:
-  ```bash
-  sudo usermod -aG dialout $USER
-  # Log out and back in, then retry
-  ```
-
-### Step 5 — Upload the Firmware
-
-1. Open `firmware/esp32_sensor_node/esp32_sensor_node.ino` in Arduino IDE.
-2. Click the **Upload** (→) arrow button.
-
-> **If the upload hangs at "Connecting…":** Hold down the **BOOT (FLASH)** button on the board, press and release **EN (RST)**, then release **BOOT** just as the IDE prints `Connecting......`. This manually triggers flash mode.
-
-3. Wait until the status bar reads **Done uploading**.
-
-### Step 6 — Verify (Optional)
-
-Open **Tools → Serial Monitor** and set the baud rate to **115200**. You will not see readable text — the firmware transmits raw binary data, which is expected. If the monitor shows garbled characters, the firmware is running correctly.
-
----
-
-## Phase 3: Raspberry Pi Software Setup
+## Phase 2: Raspberry Pi Software Setup
 
 All commands in this phase are run inside your **Pi SSH session**.
 
@@ -200,11 +134,11 @@ The default `pi` user is already in the `gpio` group and can talk to `pigpiod` w
 python3 -c "import pigpio; p=pigpio.pi(); print('pigpio connected:', p.connected)"
 ```
 
-It should print `pigpio connected: True`. If it prints `False`, start the daemon with `sudo systemctl start pigpiod` (see Phase 3, Step 1b).
+It should print `pigpio connected: True`. If it prints `False`, start the daemon with `sudo systemctl start pigpiod` (see Phase 2, Step 1b).
 
 ---
 
-## Phase 4: Configuration (optional)
+## Phase 3: Configuration (optional)
 
 By default the system needs **no network or laptop configuration** — telemetry prints to the Pi's own terminal and the demo GUI opens on the Pi's HDMI monitor. (Optional cloud streaming is covered at the end of this phase.)
 
@@ -243,13 +177,19 @@ By default the node is fully offline. To additionally stream telemetry to a [Thi
    nano .env                # set THINGSPEAK_API_KEY=<your write key>
    ```
    `.env` is git-ignored in both locations, so the key is never committed; `python-dotenv` (installed by `requirements.txt`) loads it at startup.
-4. **Run with `--cloud`** (see Phase 5). Without the flag the node ignores ThingSpeak entirely; if `--cloud` is set but the key is missing, the node logs a warning and continues offline.
+4. **Run with `--cloud`** (see Phase 4). Without the flag the node ignores ThingSpeak entirely; if `--cloud` is set but the key is missing, the node logs a warning and continues offline.
 
 > The uploader posts once every 20 s (ThingSpeak's free tier permits one update per 15 s) on a background thread, so it never slows inference. Network failures are logged and skipped — they never crash the node. Metrics that are `None` in the current state (e.g. latency while idle) are simply left out of that update.
 
+### Optional — detection snapshots (`--snapshots`)
+
+Run with `--snapshots` to save a JPEG of the frame to `./snapshots/` (at the repo root) whenever a person is detected. No setup is needed — the folder is created at runtime and is git-ignored. Captures are cooldown-gated (one per ~30 s) and the folder is ring-buffered to a file cap, so the SD card can't fill. Each filename carries the timestamp, class, confidence, and FSM state.
+
+> Like `--cloud`, this adds disk/CPU work, so keep it **off during measured benchmark runs** (see `TESTING.md`).
+
 ---
 
-## Phase 5: Running the System
+## Phase 4: Running the System
 
 The node runs on the Pi alone. The demo GUI window needs a desktop display — view it on a **physical HDMI monitor** or remotely over **VNC** (pick one below). With no display at all, run `--headless` for terminal-only telemetry.
 
@@ -287,18 +227,21 @@ source .venv/bin/activate
 python3 rpi_edge/pi_edge_node.py             # demo GUI (HDMI or VNC desktop)
 # or, with no display at all:
 python3 rpi_edge/pi_edge_node.py --headless  # terminal telemetry only
-# add --cloud to either to also stream telemetry to ThingSpeak (see Phase 4):
-python3 rpi_edge/pi_edge_node.py --headless --cloud
+# optional flags (combine with either of the above):
+python3 rpi_edge/pi_edge_node.py --headless --cloud       # also stream telemetry to ThingSpeak (Phase 3)
+python3 rpi_edge/pi_edge_node.py --headless --snapshots   # also save a JPEG to ./snapshots/ on a person detection
 ```
 
 You should see the following boot messages confirming everything initialised correctly:
 
 ```
-[SYSTEM] TFLite INT8 YOLO engines (320 + 640) successfully initialized.
-[SYSTEM] GPIO Sensor Harvester pinned to CPU Core {1}
-[SYSTEM] Vision processing core engine pinned to CPU Cores {2, 3}
-[INIT] Launching 5-State Adaptive Video Edge Node Framework (GUI enabled)...
+[INIT] Launching SAGE-Vision edge node (GUI enabled, cloud disabled, snapshots disabled)...
+[SYSTEM] GPIO sensor harvester pinned to CPU core {1}
+[SYSTEM] TFLite INT8 YOLO engines (320 + 640) initialized.
+[SYSTEM] Vision engine pinned to CPU cores {2, 3}
+[INIT] Launching 5-state FSM kernel loop...
 ```
+(The `cloud`/`snapshots` flags in the first line reflect whether you passed `--cloud` / `--snapshots`.)
 
 Telemetry begins printing to the terminal immediately — one line per loop, in every state. With the GUI enabled, the `SAGE-Vision` window shows the live feed with blue detection boxes and a HUD header bar. **Press `q` to quit cleanly, `f` to toggle fullscreen.**
 
@@ -344,7 +287,7 @@ The virtual environment is not active. Run `source .venv/bin/activate` (Linux/ma
 
 ### GUI window doesn't open / `cv2.error` about display or `imshow`
 
-The GUI needs a display and the GUI build of OpenCV. Run it from a terminal **inside the Pi's HDMI or VNC desktop session** (see Phase 5), not a bare SSH shell — or pass `--headless` to skip the window. If you intentionally installed `opencv-python-headless`, the window is unavailable — either run `--headless`, or `pip install opencv-python`.
+The GUI needs a display and the GUI build of OpenCV. Run it from a terminal **inside the Pi's HDMI or VNC desktop session** (see Phase 4), not a bare SSH shell — or pass `--headless` to skip the window. If you intentionally installed `opencv-python-headless`, the window is unavailable — either run `--headless`, or `pip install opencv-python`.
 
 ### Pipeline stays in SLEEP/STANDBY permanently despite motion
 

@@ -1,171 +1,194 @@
 # SAGE-Vision
 ### Sensor-Adaptive GPU-less Edge Vision
 
-A distributed edge intelligence pipeline that uses real-time environmental sensor data to dynamically govern a YOLOv8 INT8 object detection engine running on a Raspberry Pi 4B — reducing idle CPU usage, preventing thermal throttling, and preserving detection accuracy without a GPU.
+A Raspberry Pi 4B edge application that uses PIR, light (LDR), and ultrasonic sensors to throttle YOLOv8 inference resolution and frame rate — reducing idle power draw and CPU/SoC thermals, without a GPU and without sacrificing detection quality.
 
 ---
 
-## The Problem This Solves
+## The Problem
 
-Running a continuous computer vision inference loop on an ARM SoC like the Raspberry Pi 4B is thermally expensive. A fixed-resolution YOLOv8 model polling at full pace will push the Broadcom BCM2711 toward its 80°C throttling boundary within minutes, forcing the chip to drop its clock speed and degrade latency. Standard solutions — adding a heatsink, buying an AI accelerator hat, or switching to a weaker model — either add hardware cost or sacrifice detection quality.
+Running a continuous, fixed-resolution computer-vision loop on an ARM SoC like the Raspberry Pi 4B is thermally and energetically expensive — it pushes the Broadcom BCM2711 toward its 80 °C throttling boundary within minutes, even though most of the time the scene is empty or static. The usual fixes (a heatsink, an AI-accelerator hat, or a weaker model) either add hardware cost or sacrifice accuracy.
 
-SAGE-Vision takes a different approach: **let the physical environment decide how hard the CPU needs to work.** If nobody is in the room, inference should stop entirely. If someone is far away, lower resolution is sufficient. If the room is dark, the frame needs preprocessing before inference — not a resolution bump. Sensor data drives all three of these decisions in real time, with zero additional hardware cost beyond the IoT board already present in the lab.
-
----
-
-## System Architecture
-
-The system is **self-contained on the Raspberry Pi**. Sensors wire directly to its GPIO header; results are shown on a local HDMI GUI and logged to the Pi's own terminal — no second board and no network in the live path:
-
-```
-   Sensors ── wired to Raspberry Pi GPIO header
-   ┌──────────────────────────────────────┐
-   │  PIR (HC-SR501)  OUT ── GPIO 17        │
-   │  LM393 light     DO  ── GPIO 27        │
-   │  HC-SR04  TRIG ── GPIO 23              │
-   │           ECHO ── GPIO 24 (divider)    │
-   │  INA219 power    SDA/SCL ── I2C (opt.) │
-   └────────────────────┬───────────────────┘
-                        ▼
-┌──────────────────────────────┐
-│   Raspberry Pi 4B            │
-│                              │
-│  Thread 1 (Core 1)           │
-│   GPIO sensor harvester      │
-│   ── pigpio: PIR / LM393     │
-│      + HC-SR04 echo ISR      │
-│   ── median-filters distance │
-│   ── updates shared state    │
-│      (mutex)                 │
-│                              │
-│  Thread 2 (Cores 2+3)        │
-│   Adaptive vision loop       │
-│   ── PIR standby gate        │
-│   ── LM393 CLAHE gate        │
-│   ── Ultrasonic res gate     │
-│   ── YOLOv8 INT8 TFLite      │
-│   ── telemetry record        │
-│      ──► terminal sink       │
-│      ──► (cloud sink: TODO)  │
-│   ── on-Pi GUI (boxes + HUD) │
-└───────┬───────────────┬──────┘
-        ▼               ▼
-   HDMI monitor     Pi terminal
-   (live video +    (telemetry log,
-    blue boxes)      every state)
-```
-
-### Why This Topology
-
-The Raspberry Pi reads the sensors directly off its GPIO header through the `pigpio` daemon, which captures the HC-SR04 echo edges with hardware timestamps in its own real-time thread — the equivalent of a microcontroller ISR, but without a second board or a serial link to keep in sync. Sensor sampling lives on a thread pinned to Core 1; all inference, adaptive decision-making, and the demo GUI run on a separate thread pinned to Cores 2 & 3. Telemetry is printed to the Pi's own terminal, so the whole system runs **fully offline** by default (the `power_w` column reads the optional INA219 over I2C); an opt-in `--cloud` flag additionally streams telemetry to ThingSpeak on a background thread.
-
-The two on-Pi threads communicate only through a mutex-guarded latest-value snapshot, so a slow inference frame can never starve the sensor reader — and reading sensors directly on the Pi removes the ESP32, the serial link, and the whole class of serial-framing and buffer-overflow failure modes that came with them.
+SAGE-Vision makes **compute proportional to scene demand**: cheap sensors gate *when* and *how hard* the YOLO model runs, so the node idles near-free when nothing is happening and scales inference resolution to subject distance when it is. The target is a measurable reduction in average power, CPU utilisation, and core temperature versus an always-on baseline, with no meaningful loss in detection quality — at zero additional hardware cost beyond sensors already on the bench.
 
 ---
 
-## Finite State Machine & Sensor Core Management
+## System Overview
 
-The edge vision node uses a five-state finite state machine. Each state has explicit entry and exit conditions, making the system's behavior deterministic and auditable. The architecture eliminates resolution thrashing through hysteresis dead bands, filters ultrasonic noise through a rolling median window, and maintains a hardware failsafe that activates independently of all other state logic.
+![SAGE-Vision system architecture](docs/images/system-architecture.png)
 
----
-
-### The five states
-
-**Sleep**
-
-The system is fully idle. No camera frames are captured and the inference pipeline is completely bypassed. The CPU governor drops to powersave. This state is entered only when both sensors simultaneously agree the space is vacant: the PIR cooldown has expired with no motion detected for at least five continuous seconds, and the rolling median ultrasonic distance reads above 350 cm. Both conditions must hold — either sensor alone registering presence is sufficient to prevent entry. The system exits Sleep the instant either condition breaks: a new PIR trigger or median distance dropping below 350 cm. Exit always routes through Standby; there is no direct transition to an Active state.
-
-**Standby**
-
-A transient warmup state lasting exactly one 200 ms execution tick. No inference runs. Its purpose is to absorb hardware stabilization time before the first inference frame fires: the CPU governor is raised, a fresh sensor reading is allowed to settle, and the camera's auto-exposure arrays are given time to stabilise. After the single tick, the machine evaluates median distance and routes immediately to Active-Lo or Active-Hi. Standby also serves as the mandatory re-entry point after recovering from Watchdog, ensuring sensor data is fresh before any resolution decision is made.
-
-**Active-Lo**
-
-Runs YOLOv8n INT8 inference at 320×320 resolution with a 10 ms loop pace for responsive close-range tracking. Entered from Standby when median distance is below 120 cm. At close range, the subject occupies a large portion of the frame and 320×320 provides sufficient pixel density for reliable detection. To prevent thrashing at the boundary, the system holds this state until distance rises above 160 cm — it will not scale up at 120 cm. Presence loss (PIR cooldown expired and distance above 350 cm) transitions directly to Sleep.
-
-**Active-Hi**
-
-Runs YOLOv8n INT8 inference at 640×640 resolution with a 400 ms loop pace to conserve processing cycles. Entered from Standby when median distance is at or above 160 cm, or when the subject sits in the 120–160 cm overlap zone as the safe default. At range, the subject occupies a small pixel footprint — dropping to 320×320 here risks the detection falling below confidence threshold entirely. The system holds this state until distance drops below 120 cm. Presence loss transitions directly to Sleep.
-
-**Watchdog**
-
-A failsafe override that operates independently of all other state logic and takes unconditional priority. Entered when any of three data-integrity conditions is met: the `pigpio` daemon connection is lost, the time elapsed since the last valid ultrasonic echo exceeds 2.0 seconds, or the harvester registers three or more consecutive sonar triggers that returned no echo at all. While active, the system runs at maximum capability — 640×640 resolution with CLAHE permanently enabled — regardless of any cached sensor values, since those values can no longer be trusted. The only exit path is a successfully completed echo transaction. On exit, the machine routes through Standby before resuming normal resolution decisions.
-
-Note that the watchdog can only monitor the ultrasonic sensor and the daemon connection. The PIR and LM393 are read as digital levels — a dead or disconnected level pin reads a constant value indistinguishable from a genuinely quiet or lit room, so those two sensors cannot be health-checked. An *out-of-range* echo (an empty room) still returns a valid pulse and is treated as a healthy reading, not a failure.
+The node runs **fully offline on the Pi alone**. Sensors wire directly to the 40-pin GPIO header (read by the `pigpio` background process — there is no microcontroller in the live path); a USB camera supplies frames; a two-thread core (sensor harvester + adaptive vision/FSM) does the work, with optional background threads for power/telemetry. Inference runs on `tflite-runtime` with INT8 YOLOv8-nano models.
 
 ---
 
-### Hysteresis zones
+## Hardware & Wiring
 
-Two sensors use asymmetric entry and exit thresholds to prevent state oscillation caused by sensor noise near decision boundaries.
+### Components
 
-1. The ultrasonic distance gate uses a 40 cm dead band: the system enters Active-Lo below 120 cm and exits it only above 160 cm. Within the 120–160 cm band, the current state is held regardless of new readings.
+| Component | Part | Role |
+|---|---|---|
+| Compute | Raspberry Pi 4B | edge inference node |
+| Camera | USB UVC webcam | video frames |
+| Motion | HC-SR501 PIR | wake / presence signal |
+| Light | LM393 comparator module | dark/bright gate for CLAHE |
+| Distance | HC-SR04 ultrasonic | subject distance → model selection |
+| Power measurement | INA219 | whole-Pi power for the energy figure |
 
-2. The light gate's hysteresis now lives in hardware: the LM393 comparator supplies a digital dark/bright signal whose threshold is set by an onboard potentiometer, and the comparator's own built-in hysteresis prevents the output from chattering under flickering or transitional lighting. CLAHE simply follows that digital line — no software dead-band required.
+### Sensor → GPIO wiring (BCM numbering)
 
----
-
-### Ultrasonic median filter
-
-The HC-SR04 ultrasonic sensor produces measurement noise of ±5–10 cm at distances above one metre due to acoustic multipath reflections. Raw readings are never used directly in state logic. Instead, the Pi's sensor harvester thread maintains a circular buffer of five consecutive distance samples and feeds only the median into the shared state each cycle. This eliminates spurious spikes without introducing meaningful latency at human-movement timescales.
-
----
-
-### CLAHE preprocessing order
-
-Low-light enhancement runs orthogonally to resolution state. When active, the processing pipeline follows this fixed order: capture the full-resolution frame, apply CLAHE equalization, then resize to the target resolution, then run inference. Applying CLAHE before the resize ensures the contrast enhancement operates on maximum available pixel data. Reversing this order degrades enhancement quality by discarding spatial information before processing it.
-
----
-
-## Sensor Acquisition (on the Pi)
-
-The harvester thread reads all three sensors directly off the GPIO header via `pigpio`, at roughly a 16.6 Hz sonar cadence:
-
-| Signal | Source | Pi pin | Reading |
+| Sensor | Signal | Pi pin | Notes |
 |---|---|---|---|
-| Motion | HC-SR501 PIR `OUT` | GPIO 17 | digital level — 1 = motion |
-| Light | LM393 comparator `DO` | GPIO 27 | digital level — active-low, LOW = dark |
-| Distance | HC-SR04 `TRIG`/`ECHO` | GPIO 23 / 24 | echo pulse width → cm; −1.0 = out of range |
+| HC-SR501 PIR | OUT | GPIO 17 (pin 11) | 5V supply; output already 3.3V-safe |
+| LM393 light | DO | GPIO 27 (pin 13) | 3.3V supply; active-low (LOW = dark); hardware hysteresis via onboard pot |
+| HC-SR04 | TRIG | GPIO 23 (pin 16) | direct connection |
+| HC-SR04 | ECHO | GPIO 24 (pin 18) | **via 1kΩ/2kΩ voltage divider** (steps the 5V echo down to 3.3V) |
+| INA219 | SDA / SCL | GPIO 2 / GPIO 3 (pins 3 / 5) | I²C; address `0x40` |
 
-The ultrasonic measurement is interrupt-driven through `pigpio`: a 10 µs trigger pulse is emitted every ~60 ms, and a hardware-timestamped edge callback records the echo pulse width on both rising and falling edges — the same non-blocking ISR pattern the original firmware used, now running in the `pigpio` daemon's real-time thread. Because the daemon captures edges independently of the Python loop, sonar timing is never gated on inference load.
+### Power rails
+
+| Rail | Powers | Pi pins |
+|---|---|---|
+| 5V | HC-SR501, HC-SR04 | 2, 4 |
+| 3.3V | LM393, INA219 (logic) | 1, 17 |
+| GND | all sensor grounds + divider leg | 6, 9, 14, 20, 25, 30, 34, 39 |
+
+### INA219 power-measurement path
+
+The INA219 sits high-side, inline on the Pi's 5V USB-C feed, broken out with a female + male USB-C breakout pair so no cable is cut.
+
+| Connection | From → To |
+|---|---|
+| Shunt in | female USB-C `VBUS` → INA219 `VIN+` |
+| Shunt out | INA219 `VIN-` → male USB-C `V+` |
+| Ground | female `GND` → male `G` (common) |
+| CC pull-downs | 5.1kΩ from CC1→GND and CC2→GND on the female board (so the charger enables VBUS) |
+| Logic | `VCC`→3.3V, `GND`→GND, `SDA`→GPIO 2, `SCL`→GPIO 3 |
+
+> Full wiring, soldering, and bring-up steps are in [`docs/HARDWARE_CONNECTIONS.md`](docs/HARDWARE_CONNECTIONS.md).
 
 ---
 
-## Telemetry & the On-Pi Demo GUI
+## Sensing & Presence Fusion
 
-Each loop the vision thread assembles **one telemetry record** (a dict) and fans it out to a set of sinks:
+Each sensor has a distinct role, and the readings are filtered before use:
+
+- **Ultrasonic (primary):** each reading is spike-rejected (a jump beyond `MAX_PLAUSIBLE_JUMP_CM` is dropped unless it persists for several samples) then median-filtered over 5 samples, to absorb multipath bounce off walls/furniture.
+- **PIR:** a motion / wake trigger only.
+- **LDR (LM393):** the CLAHE low-light gate (digital dark/bright).
+
+**"Presence" is a fusion of three signals (logical OR):** PIR motion, a close ultrasonic reading (`distance < PRESENCE_DISTANCE_CM`, ~350 cm), or a YOLO person-detection (the **vision vote**). Any one signal refreshes presence; absence is declared only when **all three** have been quiet for `PRESENCE_TIMEOUT_S` (~12 s).
+
+The vision vote is essential because **PIR senses motion, not presence** — a motionless person reads identical to an empty room, so without the vision vote the node would wrongly drop to SLEEP on a still occupant.
+
+---
+
+## The 5-State FSM
+
+Inference is controlled through a 5-state finite state machine.
+
+![5-state FSM](docs/images/fsm.png)
+
+1. **SLEEP** — no inference; the loop polls at ~0.5 s watching for a wake signal. Exits to **STANDBY** when the PIR fires or the ultrasonic detects an object within `WAKE_DISTANCE_CM` (~300 cm), held long enough to pass the debounce gate.
+2. **STANDBY** — a transitional state entered on waking; no inference. Polls fast (~0.05 s) to clear a brief warm-up (`STANDBY_WARMUP_S`, ~200 ms), then picks the active state by distance.
+3. **ACTIVE-LO** — object present and **close** (`distance < HILO_CLOSE_CM`, ~120 cm). Runs the **320×320** model: a close subject is large in frame, so low resolution suffices and is cheap (low power, low latency). Loop polls at ~0.01 s for responsiveness. This is also the **wind-down** state — ACTIVE-HI drops here when presence has been quiet for over ~2 s. Exits to ACTIVE-HI if the target moves far, or to SLEEP once presence is absent (> ~12 s).
+4. **ACTIVE-HI** — object present but **far** (`distance ≥ HILO_FAR_CM`, ~160 cm). Runs the **640×640** model: a distant/small subject needs the higher resolution, but it is expensive (~1 s/frame on the Pi), so the loop is paced slow (~0.40 s). Exits to ACTIVE-LO when the target comes close or presence goes quiet.
+5. **WATCHDOG** — entered from any state immediately on sensor-health failure: a `pigpio` fault, no valid ultrasonic echo for > 2 s, or ≥ 3 consecutive dropped echo readings. Captured frames are CLAHE-preprocessed and inferred with the 640×640 model (worst-case assumption: far and dark). Exits to STANDBY only after the sensors stay healthy for ~1.5 s, so a marginal/flaky sensor cannot flap WATCHDOG ↔ ACTIVE.
+
+> **Hysteresis note:** the close (`HILO_CLOSE_CM`, ~120 cm) and far (`HILO_FAR_CM`, ~160 cm) thresholds differ on purpose — the 120–160 cm gap is a hysteresis band that, together with the transition gate below, stops the model flickering HI↔LO at the boundary.
+
+---
+
+## Robustness / Anti-Flap
+
+State decisions are debounced by a single timed **TransitionGate**: an edge commits only when its condition has held continuously for `hold_s` **and** the current state has been occupied for at least `dwell_s`. Timing the streak (rather than counting loop ticks) makes the debounce behave identically regardless of how fast the loop runs in each state.
+
+The gate guards every flicker-prone edge:
+
+- **HI ↔ LO** — condition held `HILO_HOLD_S` (~0.75 s) and ≥ `HILO_DWELL_S` (~1.5 s) in-state.
+- **SLEEP wake** — hysteretic (wake at `WAKE_DISTANCE_CM`, stay awake out to the wider `PRESENCE_DISTANCE_CM`) and confirmed (`WAKE_HOLD_S`), so a stray PIR pulse can't wake the node.
+- **WATCHDOG recovery** — sticky: leave only after the sonar stays healthy for `WATCHDOG_RECOVER_HOLD_S` and the minimum dwell elapses, so a marginal sensor can't flap the failsafe.
+
+---
+
+## Inference Engine
+
+Inference runs on **`tflite-runtime`** (the lightweight CPU interpreter — not `ultralytics`/`torch`, which are too heavy for the Pi), using **full-integer INT8 YOLOv8-nano** models. INT8 is chosen for the Pi 4B's ARM Neon SIMD unit, which does INT8 multiply-accumulate faster than FP32 and at lower memory bandwidth.
+
+Because a full-integer INT8 model bakes its input resolution in at export time, the adaptive 320/640 switch is achieved by loading **two models** (one per resolution) and selecting the matching interpreter per FSM state. The pre/post-processing that `ultralytics` would do internally is reimplemented by hand in NumPy/OpenCV: **letterbox → quantize → invoke → dequantize → decode the YOLOv8 head → NMS → map boxes back to the original frame's pixels**. Model export to `.tflite` is done off-device.
+
+### CLAHE Preprocessing
+
+Orthogonal to the 5 states, the captured frame is enhanced when the LDR reports darkness (LOW output). The BGR frame is converted to YUV and CLAHE is applied to the **Y (brightness) channel only**, leaving chroma (U, V) untouched so colour is not distorted — then converted back.
+
+- `tileGridSize = (8, 8)` — splits the frame into an 8×8 grid (64 tiles, ~80×60 px each on a 640×480 frame), equalising each tile against its own local histogram (bilinearly interpolated across tiles to avoid blocky seams).
+- `clipLimit = 2.0` — the contrast cap. The histogram has 256 bins (8-bit Y); OpenCV clips each bin at `clipLimit × (tile_pixels / 256)` ≈ 2× the average bin height (~4800 px/tile ÷ 256 ≈ 19 px → clip at ~38 px), then redistributes the excess. This bounds the slope of the equalisation curve, which stops near-flat dark regions from amplifying sensor noise. `2.0` is a deliberately mild value.
+
+WATCHDOG forces CLAHE on regardless (worst-case low-light assumption).
+
+---
+
+## Concurrency: Threading & Core Pinning
+
+To manage the Pi's limited compute and prevent jitter in frame capture and inference, work is split across threads and pinned to specific cores with `os.sched_setaffinity`:
+
+| Core | Responsibility |
+|---|---|
+| 0 | OS tasks + (optional) snapshot writing and cloud telemetry upload |
+| 1 | Sensor I/O (GPIO harvester) |
+| 2 & 3 | Camera capture, CLAHE, FSM-based inference (`tflite-runtime`), and GUI — run sequentially |
+
+The implementation uses up to **6 threads** — **4 run by default**, plus 2 that start only with their opt-in flags:
+
+- **Main** — launches the worker threads and parks until a shutdown event or `Ctrl+C`.
+- **GPIO harvester** — continuously samples PIR, LM393 (LDR), and HC-SR04 (ultrasonic).
+- **Vision engine** — camera capture, CLAHE, YOLOv8 inference, and GUI.
+- **pigpio echo callback** — runs in pigpio's own real-time thread (the ISR equivalent), timestamping ultrasonic echo edges.
+- **Cloud uploader** *(opt-in, `--cloud`)* — uploads telemetry to ThingSpeak.
+- **Snapshot writer** *(opt-in, `--snapshots`)* — writes detection frames to the SD card.
+
+Cross-thread communication:
+
+| Channel | Type | Between |
+|---|---|---|
+| `echo_lock` | mutex | pigpio echo callback ⇄ GPIO harvester |
+| shared sensor state | mutex | GPIO harvester ⇄ vision engine |
+| `_latest_record_lock` | mutex | vision engine ⇄ cloud uploader |
+| `_snapshot_queue` | bounded queue (drop-oldest) | vision engine ⇄ snapshot writer |
+
+The hot threads (sensors, vision) never block on slow I/O — they hand work to the background threads via a latest-value snapshot (sensor state, telemetry record) or a bounded queue (snapshots). This scales across cores despite Python's GIL because the heavy sections (TFLite `invoke()`, OpenCV, socket I/O) release the GIL and run as true native parallel work.
+
+---
+
+## Telemetry, Cloud & GUI
+
+Every loop the vision thread assembles **one telemetry record** (a dict) and fans it out to non-blocking sinks (so a sink can never stall the FSM). The record:
 
 | Field | Description |
 |---|---|
-| `state` | FSM state (`SLEEP`/`STANDBY`/`ACTIVE-LO`/`ACTIVE-HI`/`WATCHDOG`) |
-| `model_res` | Inference resolution / model used: `320`, `640`, or `---` when idle |
-| `latency_ms` | Per-frame inference duration |
+| `state` | FSM state (`SLEEP` / `STANDBY` / `ACTIVE-LO` / `ACTIVE-HI` / `WATCHDOG`) |
+| `model_res` | inference resolution / model used (`320`, `640`, or `---` when idle) |
+| `latency_ms` | per-frame inference duration |
 | `cpu_pct`, `cpu_temp_c` | CPU utilisation % and core temperature °C |
-| `power_w` | Whole-Pi power draw (INA219 over I2C — `-- W` until the sensor is wired) |
-| `distance_cm` | Median ultrasonic distance |
-| `detections` | List of `(label, confidence%)` — **all** detections, not capped |
+| `power_w` | whole-Pi power draw (INA219 over I²C; `-- W` until the sensor is wired) |
+| `distance_cm` | median ultrasonic distance |
+| `detections` | list of `(label, confidence%)` |
 
-The default sink is the **terminal sink** (`_terminal_sink`), which prints one line per loop to the Pi's own console — the system runs fully offline. The `power_w` column is filled by `read_power_w()`, which reads the optional INA219 over I2C (`-- W` until the sensor is wired — see `HARDWARE_CONNECTIONS.md` §4).
+The default sink is the **terminal sink**, which prints one fixed-format line per loop to the Pi's own console — so the system runs fully offline:
 
-An optional **ThingSpeak cloud sink** streams telemetry when the node is run with `--cloud` (off by default — the node stays fully offline otherwise). To keep the FSM non-blocking, `emit_telemetry()` only stashes the latest record and a background thread POSTs it every 20 s (ThingSpeak's free tier allows one update per 15 s), so the network call never runs in the inference loop. It uploads four fields:
-
-| ThingSpeak field | Value | Unit |
-|---|---|---|
-| field1 | Power | W |
-| field2 | Latency | ms |
-| field3 | CPU temp | °C |
-| field4 | Distance | cm |
-
-`None`-valued metrics (e.g. latency while idle) are omitted from a given update. The write key is read from a git-ignored `.env` (the project root or `rpi_edge/` — root takes priority) — see `SETUP.md`, Phase 4.
-
-Sample terminal line:
 ```
 [14:22:07] ACTIVE-LO | model 320 | lat   28.4ms | cpu 47.0% | temp 58.1C | pwr  -- W | dist   95.3cm | dets: Student/Person(94.2%)
 ```
 
+### Optional sinks (off by default)
+
+- **`--cloud`** — a background thread POSTs power / latency / CPU-temp / distance to a ThingSpeak channel every 20 s (the free-tier rate limit). `emit_telemetry()` only stashes the latest record, so the network call never runs in the inference loop. The write key is read from a git-ignored `.env`. See [`docs/SETUP.md`](docs/SETUP.md), Phase 4.
+- **`--snapshots`** — on a person detection, a worker thread writes a JPEG of the frame to `./snapshots/` (ring-buffered to a file cap, filename carries timestamp/class/conf/state).
+
+> Both are opt-in and add Wi-Fi/disk activity, so keep them **off during measured benchmark runs** (they would bias the INA219's whole-Pi reading).
+
 ### On-Pi GUI (demo)
 
-For demos, the node opens a local window on the Pi's HDMI monitor (run with the default; pass `--headless` to disable it for remote deployment). It shows the live camera feed with **blue detection boxes** and a solid HUD header bar above the (unobstructed) video:
+For demos the node opens a local window on the Pi's HDMI monitor (default; pass `--headless` to disable it for remote deployment). It shows the live feed with **blue detection boxes** and a HUD header above the unobstructed video:
 
 ```
 SAGE-Vision   ACTIVE-LO            ← state name colour-coded (green active / grey idle / red watchdog)
@@ -173,24 +196,23 @@ Model 320 | Objects: 3 | 28 ms | 31 FPS
 cpu 47% | 58C | -- W | dist 95 cm
 ```
 
-Boxes are pure blue `(255,0,0)`; each label (`Class conf%`) is blue with a thin black outline for legibility. During SLEEP/STANDBY the video area shows a "SYSTEM IDLE" placeholder so the window stays responsive. Keys: **`q`** quits the node cleanly, **`f`** toggles fullscreen. The GUI render runs inside the vision thread (Cores 2 & 3) and adds negligible cost — far less than encoding and streaming frames over a network would.
+During SLEEP/STANDBY the video area shows a "SYSTEM IDLE" placeholder. Keys: **`q`** quits cleanly, **`f`** toggles fullscreen. The GUI runs inside the vision thread (Cores 2 & 3) and adds negligible cost.
 
 ---
 
-## CPU Core Pinning
+## Power Measurement
 
-The Pi runs two threads pinned to separate CPU cores using `os.sched_setaffinity`:
-
-- **Core 1** — GPIO sensor harvester thread. Triggers the HC-SR04, consumes the `pigpio` echo callbacks, and polls the PIR and LM393, isolating sensor sampling from inference latency jitter.
-- **Cores 2 & 3** — Vision processing thread. OpenCV frame capture and YOLO inference share the two higher-numbered cores, leaving Core 0 free for the OS and system services.
-
-This prevents the bursty inference workload from starving the sensor reader, which would cause sensor state to fall behind reality and weaken gate responsiveness. (The `pigpio` daemon timestamps echo edges in its own thread regardless, so distance accuracy is preserved even during an inference spike.)
+The headline metric — energy draw — is measured with an **INA219** sitting high-side, inline on the Pi's incoming 5V USB-C feed (see [Hardware & Wiring](#hardware--wiring)), so it reads the **whole-Pi** power draw over I²C. The reading fills the `power_w` telemetry column (watts), and reads `-- W` until the sensor is wired. The node runs fine without it — power instrumentation is only for benchmarking.
 
 ---
 
-## Model
+## Limitations & Future Work
 
-YOLOv8n (nano) exported to TFLite with full INT8 quantisation. The INT8 format was chosen specifically for the Pi 4B's ARM Neon SIMD unit, which performs INT8 multiply-accumulate operations faster than FP32 equivalents and consumes significantly less memory bandwidth. The nano variant is sufficient because the project's target objects (person, chair, laptop, water bottle) are well-represented in the COCO training set and do not require a larger backbone for acceptable accuracy at lab distances.
+- The 640 INT8 model currently saturates (an INT8 calibration issue), weakening the ACTIVE-HI vision vote; it needs re-export with a representative calibration set.
+- **PIR and LDR are not health-monitorable** — a dead pin reads as a quiet/lit room and is invisible to the WATCHDOG (only the ultrasonic sensor is observable). An *out-of-range* echo (an empty room) still returns a valid pulse and counts as healthy.
+- `is_dark` has **no software debounce**, so CLAHE can toggle frame-to-frame at the light threshold (it relies on the LM393's hardware hysteresis).
+- The median distance filter adds ~0.12 s of lag (accepted for stability).
+- The energy benefit is **not yet proven** — it requires the INA219 rig built and a controlled measurement run against the baseline.
 
 ---
 
@@ -202,26 +224,32 @@ SAGE-Vision/
 │   └── esp32_sensor_node/
 │       └── esp32_sensor_node.ino          # LEGACY — original ESP32 sensor transmitter (unused)
 ├── rpi_edge/
-│   ├── pi_edge_node.py                    # Main adaptive inference daemon (reads GPIO sensors)
+│   ├── pi_edge_node.py                    # Main adaptive inference node (reads GPIO sensors)
 │   ├── yolo_tflite.py                     # Lightweight tflite-runtime YOLOv8 detector
 │   ├── requirements.txt                   # Pi Python dependencies
-│   ├── yolov8n_320_int8.tflite            # INT8 TFLite model — 320×320 (Active-Lo)
-│   └── yolov8n_640_int8.tflite            # INT8 TFLite model — 640×640 (Active-Hi / Watchdog)
+│   ├── .env.example                       # Template for the ThingSpeak key (copy to .env)
+│   ├── yolov8n_320_int8.tflite            # INT8 TFLite model — 320×320 (ACTIVE-LO)
+│   └── yolov8n_640_int8.tflite            # INT8 TFLite model — 640×640 (ACTIVE-HI / WATCHDOG)
 ├── test/
-│   └── test_baseline_edge.py              # Unoptimised control benchmark (terminal + GUI)
+│   ├── test_baseline_edge.py              # Unoptimised control benchmark (terminal + GUI)
+│   └── analyze_log.py                     # Parse a captured telemetry log into per-run metrics
 ├── docs/
 │   ├── SETUP.md                           # Installation and execution guide
 │   ├── TESTING.md                         # Benchmarking and validation procedure
-│   └── HARDWARE_CONNECTIONS.md            # Wiring tables for all sensors
+│   ├── HARDWARE_CONNECTIONS.md            # Wiring tables for all sensors + INA219
+│   └── ENGINEERING_LOG.md                 # Problems faced, solutions, tradeoffs, limitations
+├── snapshots/                             # Detection JPEGs (created at runtime; git-ignored)
+├── .env.example                           # Template for the ThingSpeak key (copy to .env)
 ├── .gitignore
 └── README.md                              # This file — project overview & architecture
 ```
 
 ### Documentation
 
-- [docs/SETUP.md](docs/SETUP.md) — installation and execution (HDMI or VNC display).
-- [docs/HARDWARE_CONNECTIONS.md](docs/HARDWARE_CONNECTIONS.md) — full wiring for every sensor.
+- [docs/SETUP.md](docs/SETUP.md) — installation and execution (HDMI or VNC display), plus the optional `--cloud` setup.
+- [docs/HARDWARE_CONNECTIONS.md](docs/HARDWARE_CONNECTIONS.md) — full wiring for every sensor and the INA219 power rig.
 - [docs/TESTING.md](docs/TESTING.md) — benchmarking the adaptive node against the baseline.
+- [docs/ENGINEERING_LOG.md](docs/ENGINEERING_LOG.md) — the running record of problems, fixes, and tradeoffs.
 
 ---
 
@@ -229,10 +257,12 @@ SAGE-Vision/
 
 | Decision | Rationale |
 |---|---|
-| On-Pi terminal telemetry + local GUI | Fully offline; no network in the live path, no frame-encoding overhead, no second machine |
-| Telemetry record + pluggable sinks | Terminal now; cloud/power sinks drop in later without touching the FSM |
+| On-Pi terminal telemetry + local GUI, offline by default | No network in the live path, no frame-encoding overhead, no second machine |
+| Telemetry record + non-blocking sinks | Terminal always; cloud/snapshot sinks drop in without touching the FSM |
 | Direct GPIO sensors via `pigpio` | Removes the ESP32 and serial link; hardware-timestamped echo edges keep distance accurate |
-| Thread-per-concern with mutex | Isolates GPIO sensor I/O jitter from inference loop timing |
+| Two pinned threads + core affinity | Isolates GPIO sensor I/O jitter from the inference loop's timing |
+| Sensor-fused presence (PIR ∨ proximity ∨ vision vote) | A still person is invisible to PIR alone; fusion prevents false SLEEP |
+| Timed TransitionGate on every edge | Debounce behaves identically regardless of per-state loop pace; kills flicker |
+| Two fixed-resolution INT8 models | Full-integer export bakes input size; switching models is the adaptive resolution |
 | INT8 TFLite over FP32 PyTorch | 2–4× lower inference time on ARM Neon; no GPU required |
-| CLAHE over global brightness | Preserves local contrast for detection; global boost washes out fine edges |
-| CPU core affinity pinning | Prevents OS scheduler from migrating threads mid-inference, stabilising latency |
+| CLAHE on luma over global brightness | Preserves local contrast for detection; global boost washes out fine edges |
