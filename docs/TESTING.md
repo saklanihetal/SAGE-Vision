@@ -34,6 +34,7 @@ Two runs are compared:
 - [ ] USB web camera connected
 - [ ] Both `.tflite` models present in `rpi_edge/` (`yolov8n_320_int8.tflite`, `yolov8n_640_int8.tflite`)
 - [ ] *(For the energy claim)* INA219 wired inline on the Pi's 5 V USB-C feed, I²C enabled (`i2cdetect -y 1` shows `0x40`), and `pi-ina219` installed
+- [ ] **Both nodes run with `--cloud` and `--snapshots` OFF.** The INA219 measures whole-Pi power, which includes the Wi-Fi radio and SD-card writes; `--cloud` (a Wi-Fi transmit burst every 20 s) and `--snapshots` (JPEG encode + SD write on each detection) add load only the adaptive node would carry — the baseline has neither path — biasing the energy comparison. Reserve both for live demos, never for a measured run.
 - [ ] A **stopwatch** ready for the ground-truth log
 - [ ] A **physical notepad** for manual object annotations
 - [ ] Room at approximately **25°C ambient**
@@ -56,17 +57,22 @@ The BCM2711 retains heat for several minutes after a heavy workload. Starting a 
 
 ## Capturing a run's telemetry
 
-Each script prints one telemetry line per loop. Pipe that to a log file with `tee` so you can both watch it live and keep it for analysis:
+Each script prints one telemetry line per loop to stdout. Capture it with **`tee`**, which writes the stream to a file *and* echoes it to the terminal at the same time — so you watch the run live **and** keep the full log for analysis:
 
 ```bash
 python3 <script> --headless | tee ~/run_baseline.log
 ```
 
+- `~/run_baseline.log` is the output file in your home directory (`~` = `/home/pi`); use a distinct name per run (e.g. `run_baseline.log`, `run_adaptive.log`).
+- The node `print()`s with `flush=True`, so lines appear in both places immediately.
+- `tee` captures **stdout** only (the telemetry); `Ctrl+C` ends the run and closes the file.
+- Without `tee` the lines scroll past and are lost — and Phase C needs the file.
+
 A captured line looks like:
 ```
-[14:22:07] ACTIVE-LO | model 320 | lat   28.4ms | cpu 47.0% | temp 58.1C | pwr  -- W | dist   95.3cm | dets: Student/Person(94.2%)
+[14:22:07] ACTIVE-LO | model 320 | lat   28.4ms | cpu 47.0% | temp 58.1C | pwr   5.21W | dist   95.3cm | dets: Student/Person(94.2%)
 ```
-The fields (`state`, `model`, `lat`, `cpu`, `temp`, `pwr`, `dist`, `dets`) are fixed-position and easy to parse later with `awk`/`grep` or a short Python script. `pwr` shows `-- W` until the INA219 is wired.
+Fields are `|`-delimited with inline labels. `lat` shows `---` in SLEEP/STANDBY (no inference runs there); `pwr` shows `-- W` until the INA219 is wired; the **baseline log has no `dist` field** (it uses no sensors).
 
 ---
 
@@ -170,16 +176,76 @@ Press `Ctrl+C` (or `q` if you left the GUI on). Confirm `~/run_adaptive.log` cap
 
 ## Phase C — Analysis
 
-There is no automated plotting script in the repo (the old `plot_comparison.py` / CSV pipeline was removed). Analyse the two captured logs directly — a short Python/`awk` parser over the fixed-position fields is enough. Suggested comparisons, mapped to the objectives:
+Everything you need is in the two captured logs — there is **no plotting tool or CSV pipeline to run**. You parse the fixed-format telemetry lines and compare the two runs, which were driven through the *same* activity schedule so they line up by elapsed time.
 
-- **Energy (obj. 1):** average `pwr` over each run, and Joules per detection = (mean watts × run seconds) / (number of confirmed detections). Compare baseline vs adaptive over the same schedule. *(Needs INA219.)*
-- **CPU (obj. 2):** mean/percentiles of the `cpu` column.
-- **Thermal (obj. 3):** plot `temp` vs elapsed time; the baseline should climb toward 80°C while the adaptive curve flattens lower.
-- **Latency (obj. 4):** distribution of `lat` per `state`; the adaptive `ACTIVE-LO` (320) frames should be markedly faster than baseline 640.
-- **% time-in-state (adaptive only):** count lines per `state` — shows where the savings come from (time spent in SLEEP/STANDBY vs ACTIVE).
-- **Accuracy (obj. 5):** cross-reference the `dets` column at each checkpoint against your Ground-Truth Annotation Sheet (see below).
+### Quick spot-checks (awk / grep)
 
-> Tip: filter out idle lines for the latency comparison (`grep -E 'ACTIVE|BASELINE'`), since SLEEP/STANDBY lines have no latency.
+For a fast look without writing a script:
+
+```bash
+# mean CPU% over a run
+grep -o 'cpu [0-9.]*' ~/run_adaptive.log | awk '{s+=$2; n++} END{printf "mean cpu  %.1f%%\n", s/n}'
+# peak temperature
+grep -o 'temp [0-9.]*' ~/run_adaptive.log | awk '$2>m{m=$2} END{printf "max temp  %.1fC\n", m}'
+# frames spent in each state / model
+grep -oE 'BASELINE|SLEEP|STANDBY|ACTIVE-LO|ACTIVE-HI|WATCHDOG' ~/run_adaptive.log | sort | uniq -c
+```
+
+### Full per-run summary (`test/analyze_log.py`)
+
+The repo ships a parser, [`test/analyze_log.py`](../test/analyze_log.py), that prints every objective's metric for one log — it handles both the baseline and adaptive line formats and treats `-- W` / `---` as missing. Run it once per log and compare:
+
+```bash
+python3 test/analyze_log.py ~/run_baseline.log
+python3 test/analyze_log.py ~/run_adaptive.log
+```
+
+Example output:
+```
+file              : /home/pi/run_adaptive.log
+samples / duration: 312 lines / 180 s
+mean CPU %        : 41.8
+max temp C        : 61.4
+mean latency ms   : 33.7  (active frames only)
+mean power W      : 3.95  (time-weighted)
+energy J          : 711
+J per detection   : 1.42  (per detection instance)
+time in state:
+  ACTIVE-LO :   120 s (67%)
+  SLEEP     :    40 s (22%)
+  ACTIVE-HI :    20 s (11%)
+```
+
+(The numbers above are illustrative — `pwr`/energy fill in only once the INA219 is wired.)
+
+### What each number means (mapped to the objectives)
+
+| Objective | Metric (from the script) | Expected result |
+|---|---|---|
+| 1. Energy | mean power (W), energy (J), J/detection | adaptive **lower** — time in SLEEP/LO instead of 640 |
+| 2. CPU | mean CPU % | adaptive lower, driven by idle/LO time |
+| 3. Thermal | max temp °C | baseline climbs toward 80 °C; adaptive stays lower |
+| 4. Latency | mean active latency (ms) | adaptive lower whenever ACTIVE-LO (320) runs |
+| — savings source | time-in-state | adaptive shows real SLEEP/STANDBY/LO time; baseline is ~100 % 640 |
+| 5. Accuracy | `dets` vs ground-truth sheet | adaptive matches baseline at each checkpoint |
+
+### Results table to fill in
+
+| Metric | Baseline | Adaptive | Δ |
+|---|---|---|---|
+| Mean power (W) | | | |
+| Energy (J) over run | | | |
+| Mean CPU (%) | | | |
+| Max temp (°C) | | | |
+| Mean active latency (ms) | | | |
+| % time **not** running 640 | 0 % | | |
+
+### Honest caveats
+
+- **Timestamps are 1-second resolution**, so duration and energy are approximate — fine over a multi-minute run, but don't quote them to the millijoule.
+- Power/energy are **time-weighted** by the timestamp gaps (not a flat per-line average), because loop pace differs by state — a per-line mean would let the fast ACTIVE-LO frames dominate.
+- `J per detection` counts detection *instances* across frames (a rough proxy). For *unique confirmed* objects, use the counts from the Ground-Truth Annotation Sheet instead.
+- Accuracy is judged from the `dets` column against the ground-truth sheet (next section), not by the script.
 
 ---
 
