@@ -57,7 +57,7 @@ The system is **self-contained on the Raspberry Pi**. Sensors wire directly to i
 
 ### Why This Topology
 
-The Raspberry Pi reads the sensors directly off its GPIO header through the `pigpio` daemon, which captures the HC-SR04 echo edges with hardware timestamps in its own real-time thread — the equivalent of a microcontroller ISR, but without a second board or a serial link to keep in sync. Sensor sampling lives on a thread pinned to Core 1; all inference, adaptive decision-making, and the demo GUI run on a separate thread pinned to Cores 2 & 3. Telemetry is printed to the Pi's own terminal, so the whole system runs **fully offline** (the `power_w` column reads the optional INA219 over I2C, and a cloud sink is stubbed in `pi_edge_node.py` for later).
+The Raspberry Pi reads the sensors directly off its GPIO header through the `pigpio` daemon, which captures the HC-SR04 echo edges with hardware timestamps in its own real-time thread — the equivalent of a microcontroller ISR, but without a second board or a serial link to keep in sync. Sensor sampling lives on a thread pinned to Core 1; all inference, adaptive decision-making, and the demo GUI run on a separate thread pinned to Cores 2 & 3. Telemetry is printed to the Pi's own terminal, so the whole system runs **fully offline** by default (the `power_w` column reads the optional INA219 over I2C); an opt-in `--cloud` flag additionally streams telemetry to ThingSpeak on a background thread.
 
 The two on-Pi threads communicate only through a mutex-guarded latest-value snapshot, so a slow inference frame can never starve the sensor reader — and reading sensors directly on the Pi removes the ESP32, the serial link, and the whole class of serial-framing and buffer-overflow failure modes that came with them.
 
@@ -145,8 +145,18 @@ Each loop the vision thread assembles **one telemetry record** (a dict) and fans
 | `distance_cm` | Median ultrasonic distance |
 | `detections` | List of `(label, confidence%)` — **all** detections, not capped |
 
-The only active sink today is the **terminal sink** (`_terminal_sink`), which prints one line per loop to the Pi's own console — the system runs fully offline. The `power_w` column is filled by `read_power_w()`, which reads the optional INA219 over I2C (`-- W` until the sensor is wired — see `HARDWARE_CONNECTIONS.md` §4). One sink is stubbed for later, designed to be non-blocking so it never stalls the FSM:
-- `_cloud_sink()` — push records to a cloud platform (one line to enable in `emit_telemetry`).
+The default sink is the **terminal sink** (`_terminal_sink`), which prints one line per loop to the Pi's own console — the system runs fully offline. The `power_w` column is filled by `read_power_w()`, which reads the optional INA219 over I2C (`-- W` until the sensor is wired — see `HARDWARE_CONNECTIONS.md` §4).
+
+An optional **ThingSpeak cloud sink** streams telemetry when the node is run with `--cloud` (off by default — the node stays fully offline otherwise). To keep the FSM non-blocking, `emit_telemetry()` only stashes the latest record and a background thread POSTs it every 20 s (ThingSpeak's free tier allows one update per 15 s), so the network call never runs in the inference loop. It uploads four fields:
+
+| ThingSpeak field | Value | Unit |
+|---|---|---|
+| field1 | Power | W |
+| field2 | Latency | ms |
+| field3 | CPU temp | °C |
+| field4 | Distance | cm |
+
+`None`-valued metrics (e.g. latency while idle) are omitted from a given update. The write key is read from a git-ignored `.env` (the project root or `rpi_edge/` — root takes priority) — see `SETUP.md`, Phase 4.
 
 Sample terminal line:
 ```

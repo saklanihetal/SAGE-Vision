@@ -206,7 +206,7 @@ It should print `pigpio connected: True`. If it prints `False`, start the daemon
 
 ## Phase 4: Configuration (optional)
 
-The system needs **no network or laptop configuration** — telemetry prints to the Pi's own terminal and the demo GUI opens on the Pi's HDMI monitor.
+By default the system needs **no network or laptop configuration** — telemetry prints to the Pi's own terminal and the demo GUI opens on the Pi's HDMI monitor. (Optional cloud streaming is covered at the end of this phase.)
 
 The only thing you may need to change is the GPIO pin map, and only if you wired the sensors differently from the defaults. In your Pi session:
 
@@ -222,6 +222,30 @@ TRIG_PIN = 23   # HC-SR04 TRIG
 ECHO_PIN = 24   # HC-SR04 ECHO (via divider)
 ```
 Edit them to match your wiring, then save: `Ctrl+O` → `Enter` → `Ctrl+X`.
+
+### Optional — ThingSpeak cloud telemetry (`--cloud`)
+
+By default the node is fully offline. To additionally stream telemetry to a [ThingSpeak](https://thingspeak.com) channel, set it up once:
+
+1. **Create a ThingSpeak channel** with four fields, named to match the upload mapping:
+
+   | Field | Name | Unit |
+   |---|---|---|
+   | Field 1 | Power | W |
+   | Field 2 | Latency | ms |
+   | Field 3 | CPU temp | °C |
+   | Field 4 | Distance | cm |
+
+2. **Copy the channel's Write API Key** (channel → *API Keys* tab).
+3. **Create the `.env` file** on the Pi from the committed template and paste your key in. It can live in the **project root** or in **`rpi_edge/`** — the loader checks the root first, then `rpi_edge/`:
+   ```bash
+   cp .env.example .env     # project root (or: cp rpi_edge/.env.example rpi_edge/.env)
+   nano .env                # set THINGSPEAK_API_KEY=<your write key>
+   ```
+   `.env` is git-ignored in both locations, so the key is never committed; `python-dotenv` (installed by `requirements.txt`) loads it at startup.
+4. **Run with `--cloud`** (see Phase 5). Without the flag the node ignores ThingSpeak entirely; if `--cloud` is set but the key is missing, the node logs a warning and continues offline.
+
+> The uploader posts once every 20 s (ThingSpeak's free tier permits one update per 15 s) on a background thread, so it never slows inference. Network failures are logged and skipped — they never crash the node. Metrics that are `None` in the current state (e.g. latency while idle) are simply left out of that update.
 
 ---
 
@@ -263,6 +287,8 @@ source .venv/bin/activate
 python3 rpi_edge/pi_edge_node.py             # demo GUI (HDMI or VNC desktop)
 # or, with no display at all:
 python3 rpi_edge/pi_edge_node.py --headless  # terminal telemetry only
+# add --cloud to either to also stream telemetry to ThingSpeak (see Phase 4):
+python3 rpi_edge/pi_edge_node.py --headless --cloud
 ```
 
 You should see the following boot messages confirming everything initialised correctly:

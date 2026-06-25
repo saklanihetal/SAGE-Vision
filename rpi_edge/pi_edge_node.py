@@ -3,10 +3,13 @@ import sys
 import time
 import argparse
 import threading
+import urllib.request
+import urllib.parse
 import cv2
 import numpy as np
 import psutil
 import pigpio
+from dotenv import load_dotenv
 from yolo_tflite import YoloTFLite
 
 # =========================================================================
@@ -258,10 +261,72 @@ def build_detection_pairs(class_ids, confidences):
     ]
 
 
+# =========================================================================
+# THINGSPEAK CLOUD TELEMETRY (optional — enabled with --cloud)
+# =========================================================================
+# Free ThingSpeak accepts one update per 15s, far slower than the per-frame
+# telemetry loop, so the cloud is sampled on a timer: emit_telemetry() stashes
+# the latest record (a non-blocking locked assignment) and the uploader thread
+# POSTs it every CLOUD_INTERVAL_S, so the HTTP call never runs in the loop.
+# The write key is read from a git-ignored .env (never hardcoded). The loader
+# checks the project root first, then this script's directory, so a .env in
+# either location works — copy .env.example to .env and fill it in.
+_here = os.path.dirname(os.path.abspath(__file__))
+for _env_path in (os.path.join(os.path.dirname(_here), ".env"),  # project root
+                  os.path.join(_here, ".env")):                  # next to this script
+    if os.path.isfile(_env_path):
+        load_dotenv(_env_path)
+        break
+THINGSPEAK_WRITE_KEY = os.environ.get("THINGSPEAK_API_KEY", "")
+THINGSPEAK_URL = "https://api.thingspeak.com/update"
+CLOUD_INTERVAL_S = 20.0       # >= 15s free-tier floor, with margin
+CLOUD_HTTP_TIMEOUT_S = 10.0   # cap a slow/hung POST so the thread never wedges
+ENABLE_CLOUD = False          # overridden by the --cloud CLI flag in __main__
+
+_latest_record = None
+_latest_record_lock = threading.Lock()
+
+
 def emit_telemetry(record):
     """Fan a telemetry record out to all active sinks."""
     _terminal_sink(record)
-    # _cloud_sink(record)   # TODO: enable once the cloud platform is chosen
+    if ENABLE_CLOUD:                      # stash latest for the uploader thread
+        global _latest_record
+        with _latest_record_lock:
+            _latest_record = record
+
+
+def cloud_uploader_worker():
+    """Background thread: every CLOUD_INTERVAL_S, POST the latest telemetry
+    record to ThingSpeak. None-valued metrics are omitted (ThingSpeak leaves
+    that field unchanged); network failures are logged and swallowed so the
+    node keeps running offline-first."""
+    print(f"[CLOUD] ThingSpeak uploader started ({CLOUD_INTERVAL_S:.0f}s interval).", flush=True)
+    while not shutdown_event.wait(CLOUD_INTERVAL_S):   # also wakes on shutdown
+        with _latest_record_lock:
+            record = _latest_record
+        if record is None:
+            continue
+
+        fields = {}
+        if record.get("power_w") is not None:
+            fields["field1"] = f"{record['power_w']:.3f}"     # power (W)
+        if record.get("latency_ms") is not None:
+            fields["field2"] = f"{record['latency_ms']:.1f}"  # latency (ms)
+        if record.get("cpu_temp_c") is not None:
+            fields["field3"] = f"{record['cpu_temp_c']:.1f}"  # CPU temp (C)
+        if record.get("distance_cm") is not None:
+            fields["field4"] = f"{record['distance_cm']:.1f}" # distance (cm)
+        if not fields:
+            continue
+
+        url = f"{THINGSPEAK_URL}?api_key={THINGSPEAK_WRITE_KEY}&{urllib.parse.urlencode(fields)}"
+        try:
+            with urllib.request.urlopen(url, timeout=CLOUD_HTTP_TIMEOUT_S) as resp:
+                if resp.read().decode().strip() == "0":   # "0" = rejected (rate limit / bad key)
+                    print("[CLOUD] update rejected (rate limit / invalid key?).", flush=True)
+        except Exception as exc:
+            print(f"[CLOUD] upload failed ({exc}); will retry next interval.", flush=True)
 
 
 def _terminal_sink(record):
@@ -736,15 +801,26 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SAGE-Vision adaptive edge inference node")
     parser.add_argument("--headless", action="store_true",
                         help="run without the on-Pi GUI window (remote / no-monitor deployment)")
+    parser.add_argument("--cloud", action="store_true",
+                        help="stream telemetry (power, latency, CPU temp, distance) to ThingSpeak every 20s")
     args = parser.parse_args()
     ENABLE_GUI = not args.headless
+    ENABLE_CLOUD = args.cloud
+    if ENABLE_CLOUD and not THINGSPEAK_WRITE_KEY:
+        print("[CLOUD] --cloud set but THINGSPEAK_API_KEY is empty (check rpi_edge/.env); "
+              "cloud upload disabled.", flush=True)
+        ENABLE_CLOUD = False
 
-    print(f"[INIT] Launching SAGE-Vision edge node (GUI {'enabled' if ENABLE_GUI else 'disabled'})...", flush=True)
+    print(f"[INIT] Launching SAGE-Vision edge node "
+          f"(GUI {'enabled' if ENABLE_GUI else 'disabled'}, "
+          f"cloud {'enabled' if ENABLE_CLOUD else 'disabled'})...", flush=True)
     harvester_thread = threading.Thread(target=gpio_harvester_worker, daemon=True)
     vision_thread = threading.Thread(target=adaptive_vision_streamer, daemon=True)
 
     harvester_thread.start()
     vision_thread.start()
+    if ENABLE_CLOUD:
+        threading.Thread(target=cloud_uploader_worker, daemon=True).start()
 
     try:
         shutdown_event.wait()
