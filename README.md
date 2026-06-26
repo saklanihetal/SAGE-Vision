@@ -86,7 +86,8 @@ The vision vote is essential because **PIR senses motion, not presence** — a m
 
 Inference is controlled through a 5-state finite state machine.
 
-<img width="1619" height="972" alt="5 state FSM" src="https://github.com/user-attachments/assets/f852ccb6-f5ae-4b7d-8592-cd0f8cd3200a" />
+<img width="1619" height="972" alt="5 state fsm" src="https://github.com/user-attachments/assets/7e3044b8-8719-41cb-9517-a6dd5209a878" />
+
 
 1. **SLEEP** — no inference; the loop polls at ~0.5 s watching for a wake signal. Exits to **STANDBY** when the PIR fires or the ultrasonic detects an object within `WAKE_DISTANCE_CM` (~300 cm), held long enough to pass the debounce gate.
 2. **STANDBY** — a transitional state entered on waking; no inference. Polls fast (~0.05 s) to clear a brief warm-up (`STANDBY_WARMUP_S`, ~200 ms), then **always enters ACTIVE-LO** (it no longer branches on distance — see ACTIVE-LO for why).
