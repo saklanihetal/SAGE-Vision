@@ -857,7 +857,13 @@ def adaptive_vision_streamer():
 
         # Select the model and loop pacing for the current state.
         if current_state == STATE_ACTIVE_LO:
-            detector, img_inference_size, loop_pacing_rate = model_lo, 320, 0.01   # close: highly responsive
+            # Close: cheap 320 model, but the loop is FPS-capped (not run flat-out).
+            # A cheap model only saves power if the frame rate is also capped --
+            # otherwise the CPU stays pegged and ACTIVE-LO draws as much as the
+            # always-on baseline. ~0.15s leaves idle time between inferences so
+            # this state genuinely costs less; lower it for snappier tracking at
+            # the price of higher power.
+            detector, img_inference_size, loop_pacing_rate = model_lo, 320, 0.15
         elif current_state == STATE_ACTIVE_HI:
             detector, img_inference_size, loop_pacing_rate = model_hi, 640, 0.40   # far: slow to save resources
         else:  # STATE_WATCHDOG
