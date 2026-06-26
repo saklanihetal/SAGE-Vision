@@ -12,8 +12,8 @@ The experiment is designed to produce empirical evidence for these claims:
 
 1. **Energy reduction** — the adaptive system draws less average power, and fewer Joules per confirmed detection, over a realistic occupancy pattern. *(Requires the optional INA219; see `HARDWARE_CONNECTIONS.md`.)*
 2. **CPU reduction** — the adaptive system uses less processor time during idle and low-complexity states.
-3. **Thermal stabilisation** — the adaptive system keeps the BCM2711 SoC away from the 80°C throttling boundary.
-4. **Latency improvement** — dynamic resolution scaling reduces per-frame inference time when subjects are close.
+3. **Thermal reduction** — the adaptive system holds the BCM2711 SoC at a lower **average / steady-state temperature** than the always-on baseline. (We report average temperature, not throttle events: the test hardware never reached the 80°C throttle point.)
+4. **Latency improvement** — dynamic resolution scaling reduces per-frame inference time when subjects are close, and waking into low-resolution first reduces the wake-up latency (time-to-first-detection after a wake; reported by `analyze_log.py`).
 5. **Accuracy preservation** — the optimisations do not meaningfully degrade detection quality versus the baseline.
 
 Two runs are compared:
@@ -22,6 +22,8 @@ Two runs are compared:
 - **Phase B — Adaptive (Experimental):** full system with all three sensor gates active (`rpi_edge/pi_edge_node.py`).
 
 > **Fairness rule:** run **both** phases the same way. Use `--headless` for both benchmark runs so the GUI's display cost is not counted in one but not the other. Reserve the GUI for demos, not for the numbers you publish.
+
+> **Why the adaptive node should win (and how not to sabotage the run):** a reduced-resolution state lowers power *only if its frame rate is also capped* — an uncapped cheap model saturates the CPU and draws as much as the full-resolution one (ACTIVE-LO is capped to ~3 fps for exactly this reason). And the saving comes from *time spent idle*, so a measured run must include realistic **absence** (long stretches with nobody present); a run where someone sits in frame the whole time pins the node in ACTIVE-LO and shows no benefit.
 
 ---
 
@@ -224,7 +226,7 @@ time in state:
 |---|---|---|
 | 1. Energy | mean power (W), energy (J), J/detection | adaptive **lower** — time in SLEEP/LO instead of 640 |
 | 2. CPU | mean CPU % | adaptive lower, driven by idle/LO time |
-| 3. Thermal | max temp °C | baseline climbs toward 80 °C; adaptive stays lower |
+| 3. Thermal | mean & max temp °C | adaptive holds a lower average temperature |
 | 4. Latency | mean active latency (ms) | adaptive lower whenever ACTIVE-LO (320) runs |
 | — savings source | time-in-state | adaptive shows real SLEEP/STANDBY/LO time; baseline is ~100 % 640 |
 | 5. Accuracy | `dets` vs ground-truth sheet | adaptive matches baseline at each checkpoint |
@@ -236,9 +238,12 @@ time in state:
 | Mean power (W) | | | |
 | Energy (J) over run | | | |
 | Mean CPU (%) | | | |
+| Mean temp (°C) | | | |
 | Max temp (°C) | | | |
 | Mean active latency (ms) | | | |
+| Wake latency (ms) — first detection after wake | n/a | | |
 | % time **not** running 640 | 0 % | | |
+| Footprint — models / code | 3.6 MB (1 model) / ~336 LOC | 6.9 MB (2 models) / ~1,051 LOC + deps | larger |
 
 ### Honest caveats
 

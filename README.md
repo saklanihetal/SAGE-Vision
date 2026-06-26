@@ -7,7 +7,7 @@ A Raspberry Pi 4B edge application that uses PIR, light (LDR), and ultrasonic se
 
 ## The Problem
 
-Running a continuous, fixed-resolution computer-vision loop on an ARM SoC like the Raspberry Pi 4B is thermally and energetically expensive — it pushes the Broadcom BCM2711 toward its 80 °C throttling boundary within minutes, even though most of the time the scene is empty or static. The usual fixes (a heatsink, an AI-accelerator hat, or a weaker model) either add hardware cost or sacrifice accuracy.
+Running a continuous, fixed-resolution computer-vision loop on an ARM SoC like the Raspberry Pi 4B keeps the CPU under sustained load — drawing high power and holding the SoC at an elevated temperature for the entire session — even though most of the time the scene is empty or static. The usual fixes (a heatsink, an AI-accelerator hat, or a weaker model) either add hardware cost or sacrifice accuracy.
 
 SAGE-Vision makes **compute proportional to scene demand**: cheap sensors gate *when* and *how hard* the YOLO model runs, so the node idles near-free when nothing is happening and scales inference resolution to subject distance when it is. The target is a measurable reduction in **average power draw and core temperature** versus an always-on baseline, with no meaningful loss in detection quality — at zero additional hardware cost beyond sensors already on the bench.
 
@@ -89,12 +89,14 @@ Inference is controlled through a 5-state finite state machine.
 <img width="1619" height="972" alt="5 state FSM" src="https://github.com/user-attachments/assets/f852ccb6-f5ae-4b7d-8592-cd0f8cd3200a" />
 
 1. **SLEEP** — no inference; the loop polls at ~0.5 s watching for a wake signal. Exits to **STANDBY** when the PIR fires or the ultrasonic detects an object within `WAKE_DISTANCE_CM` (~300 cm), held long enough to pass the debounce gate.
-2. **STANDBY** — a transitional state entered on waking; no inference. Polls fast (~0.05 s) to clear a brief warm-up (`STANDBY_WARMUP_S`, ~200 ms), then picks the active state by distance.
-3. **ACTIVE-LO** — object present and **close** (`distance < HILO_CLOSE_CM`, ~120 cm). Runs the **320×320** model: a close subject is large in frame, so low resolution suffices and is cheap (low power, low latency). Loop polls at ~0.01 s for responsiveness. This is also the **wind-down** state — ACTIVE-HI drops here when presence has been quiet for over ~2 s. Exits to ACTIVE-HI if the target moves far, or to SLEEP once presence is absent (> ~12 s).
+2. **STANDBY** — a transitional state entered on waking; no inference. Polls fast (~0.05 s) to clear a brief warm-up (`STANDBY_WARMUP_S`, ~200 ms), then **always enters ACTIVE-LO** (it no longer branches on distance — see ACTIVE-LO for why).
+3. **ACTIVE-LO** — object present and **close** (`distance < HILO_CLOSE_CM`, ~120 cm). Runs the **320×320** model: a close subject is large in frame, so low resolution suffices and is cheap. The loop is **frame-rate-capped (~0.15 s)** — a cheap model only saves power if the rate is also capped, otherwise it pegs the CPU just like the always-on baseline. ACTIVE-LO is also the **wake-entry** state (the node always exits STANDBY into ACTIVE-LO regardless of distance, so the first frames after a wake are captured immediately at low resolution; a far subject is then escalated to ACTIVE-HI by the gate) and the **wind-down** state (ACTIVE-HI drops here when presence has been quiet for over ~2 s). Exits to ACTIVE-HI if the target moves far, or to SLEEP once presence is absent (> ~12 s).
 4. **ACTIVE-HI** — object present but **far** (`distance ≥ HILO_FAR_CM`, ~160 cm). Runs the **640×640** model: a distant/small subject needs the higher resolution, but it is expensive (~1 s/frame on the Pi), so the loop is paced slow (~0.40 s). Exits to ACTIVE-LO when the target comes close or presence goes quiet.
 5. **WATCHDOG** — entered from any state immediately on sensor-health failure: a `pigpio` fault, no valid ultrasonic echo for > 2 s, or ≥ 3 consecutive dropped echo readings. Captured frames are CLAHE-preprocessed and inferred with the 640×640 model (worst-case assumption: far and dark). Exits to STANDBY only after the sensors stay healthy for ~1.5 s, so a marginal/flaky sensor cannot flap WATCHDOG ↔ ACTIVE.
 
 > **Hysteresis note:** the close (`HILO_CLOSE_CM`, ~120 cm) and far (`HILO_FAR_CM`, ~160 cm) thresholds differ on purpose — the 120–160 cm gap is a hysteresis band that, together with the transition gate below, stops the model flickering HI↔LO at the boundary.
+
+> **Wake-latency note:** on every wake the node enters ACTIVE-LO first, so the first detection appears as soon as a fast 320 frame completes (~0.7–0.9 s after the wake signal) instead of waiting on a slow 640 frame (~1.5 s). The node prints a `[WAKE] first inference … ms after wake signal` line so this latency can be measured directly (`test/analyze_log.py` reports it).
 
 ---
 
@@ -206,9 +208,41 @@ The headline metric — energy draw — is measured with an **INA219** sitting h
 
 ---
 
+## Wake-Up Latency
+
+When a subject appears, the node is in SLEEP and inference only begins after it exits the low-power state — so the scene is *missed* for the duration of that exit. We define **wake-up latency** as the interval from the wake signal to the first completed inference (the first available detection):
+
+```
+T_wake = T_sample + T_confirm + T_warmup + T_infer
+```
+
+| Term | Meaning | Constant | Value |
+|---|---|---|---|
+| `T_sample` | delay to *observe* the wake signal (SLEEP poll period; uniform 0–period → mean = period/2) | SLEEP loop ≈ 0.5 s | ~0.25 s (mean) |
+| `T_confirm` | wake debounce hold (signal must persist) | `WAKE_HOLD_S` | 0.5 s |
+| `T_warmup` | STANDBY warm-up | `STANDBY_WARMUP_S` | 0.2 s |
+| `T_infer` | first inference time | 320 (LO-first) or 640 (HI-first) | ~0.19 s / ~0.76 s |
+
+The node measures the **deterministic** part — `T_confirm + T_warmup + T_infer` — directly: it timestamps the wake signal and prints `[WAKE] first inference … ms after wake signal`, which `test/analyze_log.py` aggregates (mean / min / max). The `T_sample` term (sampling jitter before the signal is observed) adds a further ≤ 0.5 s on top.
+
+**Effect of wake-into-low-resolution-first.** Entering ACTIVE-LO (320) on every wake instead of ACTIVE-HI (640) changes *only* `T_infer` — the other three terms are identical — so the improvement is exactly the difference in first-frame inference time:
+
+```
+ΔT_wake = T_infer(640) − T_infer(320) ≈ 0.76 − 0.19 = 0.57 s
+```
+
+| Wake strategy | `T_infer` | `T_wake` (mean) |
+|---|---|---|
+| HI-first (640) — *previous* | ~0.76 s | 0.25 + 0.5 + 0.2 + 0.76 = **~1.71 s** |
+| LO-first (320) — *current* | ~0.19 s | 0.25 + 0.5 + 0.2 + 0.19 = **~1.14 s** |
+
+→ **~0.57 s faster to first detection (~33 % lower wake latency)**, with the largest gain for distant subjects, which previously paid the full 640 cost on the very first frame. The inference figures use published Pi-4 YOLOv8n timings (~760 ms at 640, ~190 ms at 320); substitute your own measured `[WAKE]` values for the final numbers.
+
+---
+
 ## Limitations & Future Work
 
-- The 640 INT8 model currently saturates (an INT8 calibration issue), weakening the ACTIVE-HI vision vote; it needs re-export with a representative calibration set.
+- The 640 INT8 model previously saturated (an INT8 calibration issue); it has been **re-exported with COCO128 calibration** (`rpi_edge/export_yolo_int8.py`) — verify on-device (Netron + a live run) before fully trusting ACTIVE-HI accuracy.
 - **PIR and LDR are not health-monitorable** — a dead pin reads as a quiet/lit room and is invisible to the WATCHDOG (only the ultrasonic sensor is observable). An *out-of-range* echo (an empty room) still returns a valid pulse and counts as healthy.
 - `is_dark` has **no software debounce**, so CLAHE can toggle frame-to-frame at the light threshold (it relies on the LM393's hardware hysteresis).
 - The median distance filter adds ~0.12 s of lag (accepted for stability).
@@ -228,6 +262,8 @@ SAGE-Vision/
 │   ├── yolo_tflite.py                     # Lightweight tflite-runtime YOLOv8 detector
 │   ├── requirements.txt                   # Pi Python dependencies
 │   ├── .env.example                       # Template for the ThingSpeak key (copy to .env)
+│   ├── export_yolo_int8.py                # Off-device: re-export calibrated INT8 TFLite models
+│   ├── coco128.yaml                       # Calibration dataset config for the export
 │   ├── yolov8n_320_int8.tflite            # INT8 TFLite model — 320×320 (ACTIVE-LO)
 │   └── yolov8n_640_int8.tflite            # INT8 TFLite model — 640×640 (ACTIVE-HI / WATCHDOG)
 ├── test/

@@ -91,6 +91,7 @@ def main(path):
     print(f"file              : {path}")
     print(f"samples / duration: {n} lines / {dur} s")
     print(f"mean CPU %        : {mean(cpu):.1f}")
+    print(f"mean temp C       : {mean(temp):.1f}" if temp else "mean temp C       : n/a")
     print(f"max temp C        : {max(temp):.1f}" if temp else "max temp C        : n/a")
     print(f"mean latency ms   : {mean(lat):.1f}  (active frames only)" if lat else "mean latency ms   : n/a")
     wl = wake_latencies(path)
