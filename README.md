@@ -76,9 +76,17 @@ Each sensor has a distinct role, and the readings are filtered before use:
 - **PIR:** a motion / wake trigger only.
 - **LDR (LM393):** the CLAHE low-light gate (digital dark/bright).
 
-**"Presence" is a fusion of three signals (logical OR):** PIR motion, a close ultrasonic reading (`distance < PRESENCE_DISTANCE_CM`, ~350 cm), or a YOLO person-detection (the **vision vote**). Any one signal refreshes presence; absence is declared only when **all three** have been quiet for `PRESENCE_TIMEOUT_S` (~12 s).
+**Keep-awake is a logical OR; the expensive state is not.** Any one signal — PIR motion, a close ultrasonic reading (`distance < PRESENCE_DISTANCE_CM`, ~350 cm), or a YOLO person-detection (the **vision vote**) — keeps the node *awake*; absence is declared only when **all three** have been quiet for `PRESENCE_TIMEOUT_S` (~12 s). The vision vote is what distinguishes a **still occupant** (no motion, but detected) from an empty room — the failure mode of motion-only systems.
 
-The vision vote is essential because **PIR senses motion, not presence** — a motionless person reads identical to an empty room, so without the vision vote the node would wrongly drop to SLEEP on a still occupant.
+But the three signals are **not equally trustworthy**, so they do not equally unlock the expensive ACTIVE-HI state (**tiered presence**):
+
+| Signal | Confirms | Unlocks ACTIVE-HI? |
+|---|---|---|
+| **Vision** (confident person) | a *person* | yes — holds HI, and arbitrates the others |
+| **Proximity** (<350 cm) | a real *object* (maybe furniture) | only a **time-limited HI probe** — demoted to LO if vision stays silent |
+| **PIR** (motion) | a heat/motion *change* (maybe sunlight) | no — wakes + keeps a cheap LO probe only |
+
+This bounds the cost of any single false positive (a spurious PIR from sunlight, or static furniture within range) to the cheap LO probe, while still giving a genuinely *far* person the high-resolution look needed to detect them. And because the LO probe keeps running inference, a person who later (re-)appears is re-detected by the vision vote and escalated back to HI — the demotion is **self-correcting**. See `docs/ENGINEERING_LOG.md` (P9) for the worked edge cases.
 
 ---
 
