@@ -672,6 +672,8 @@ def adaptive_vision_streamer():
     # signal; last_person_epoch is the vision vote, refreshed when YOLO sees a person.
     last_presence_epoch = time.time()
     last_person_epoch = 0.0
+    wake_signal_epoch = None       # stamped in SLEEP when a wake signal first appears;
+                                   # used to time wake-signal -> first inference latency
 
     print("[INIT] Launching 5-state FSM kernel loop...", flush=True)
 
@@ -738,20 +740,29 @@ def adaptive_vision_streamer():
             # Wake on sustained motion or a target stepping inside WAKE_DISTANCE_CM.
             # The gate's hold requirement filters single stray PIR pulses / blips.
             wake_signal = (pir == 1) or (distance < WAKE_DISTANCE_CM)
-            if wake_signal and gate.request(STATE_STANDBY, now, WAKE_HOLD_S, dwell_s=0.0):
-                current_state = STATE_STANDBY
-                standby_start = now
-                gate.enter(now)
-                print("[FSM] SLEEP -> STANDBY. Wake confirmed.", flush=True)
-            elif not wake_signal:
+            if wake_signal:
+                if wake_signal_epoch is None:     # stamp the moment the signal appears,
+                    wake_signal_epoch = now       # so wake latency spans the full exit
+                if gate.request(STATE_STANDBY, now, WAKE_HOLD_S, dwell_s=0.0):
+                    current_state = STATE_STANDBY
+                    standby_start = now
+                    gate.enter(now)
+                    print("[FSM] SLEEP -> STANDBY. Wake confirmed.", flush=True)
+            else:
+                wake_signal_epoch = None           # signal lapsed before confirming
                 gate.clear()
 
         elif current_state == STATE_STANDBY:
-            # Brief warmup, then pick the model from the current distance.
+            # Brief warmup, then ALWAYS wake into ACTIVE-LO (cheap/fast 320),
+            # regardless of distance. This captures the first frames immediately at
+            # low resolution; a genuinely far subject is escalated to ACTIVE-HI by
+            # the normal HI/LO gate afterwards. It hides the ~0.7s first-640-frame
+            # latency behind responsive low-res frames and shortens time-to-first-
+            # detection (see the [WAKE] latency metric).
             if now - standby_start >= STANDBY_WARMUP_S:
-                current_state = STATE_ACTIVE_LO if distance < HILO_CLOSE_CM else STATE_ACTIVE_HI
+                current_state = STATE_ACTIVE_LO
                 gate.enter(now)
-                print(f"[FSM] STANDBY -> {current_state} (distance {distance:.1f}cm).", flush=True)
+                print("[FSM] STANDBY -> ACTIVE-LO (wake into low-res first).", flush=True)
 
         elif current_state == STATE_ACTIVE_LO:
             if absent:
@@ -872,6 +883,13 @@ def adaptive_vision_streamer():
         start_inference = time.time()
         detected_classes, detected_confidences, detected_boxes = detector(processed_frame)
         inference_duration_ms = (time.time() - start_inference) * 1000.0
+
+        # Wake latency: time from the wake signal (in SLEEP) to this first inference
+        # result -- i.e. how much scene was missed while exiting the low-power state.
+        if wake_signal_epoch is not None:
+            print(f"[WAKE] first inference {(time.time() - wake_signal_epoch) * 1000.0:.0f} ms "
+                  f"after wake signal.", flush=True)
+            wake_signal_epoch = None
 
         # Vision presence vote: a detected person keeps the node awake even with
         # no PIR motion (a motionless-but-visible occupant).

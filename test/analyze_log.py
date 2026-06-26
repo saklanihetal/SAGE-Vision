@@ -51,6 +51,17 @@ def parse(path):
     return rows
 
 
+def wake_latencies(path):
+    """Wake-signal -> first-inference latencies (ms) from the [WAKE] log lines."""
+    out = []
+    with open(path) as f:
+        for line in f:
+            m = re.search(r"\[WAKE\].*?([\d.]+)\s*ms", line)
+            if m:
+                out.append(float(m.group(1)))
+    return out
+
+
 def main(path):
     rows = parse(path)
     if not rows:
@@ -82,6 +93,9 @@ def main(path):
     print(f"mean CPU %        : {mean(cpu):.1f}")
     print(f"max temp C        : {max(temp):.1f}" if temp else "max temp C        : n/a")
     print(f"mean latency ms   : {mean(lat):.1f}  (active frames only)" if lat else "mean latency ms   : n/a")
+    wl = wake_latencies(path)
+    if wl:
+        print(f"wake latency ms   : mean {mean(wl):.0f}, min {min(wl):.0f}, max {max(wl):.0f}  (n={len(wl)})")
     if pwr_time:
         print(f"mean power W      : {energy / pwr_time:.2f}  (time-weighted)")
         print(f"energy J          : {energy:.0f}")
