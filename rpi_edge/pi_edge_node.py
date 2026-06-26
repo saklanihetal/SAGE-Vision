@@ -65,6 +65,19 @@ consecutive_jump_count = 0
 PRESENCE_TIMEOUT_S = 12.0
 PERSON_CLASS_ID    = 0            # YOLO/COCO dense index for "person"
 
+# Tiered presence (P9): the three signals are NOT equally trustworthy, so they unlock
+# different things. A confident VISION person-detection is the only confirmation of a
+# *person*: it holds ACTIVE-HI and debunks the weaker signals. PROXIMITY detects a real
+# object but can't tell a person from furniture, so it unlocks HI only as a time-limited
+# PROBE (run the 640 model to look); if vision stays silent for PROXIMITY_PROBE_S the
+# object is treated as a non-person and HI is demoted to the cheap LO probe. PIR motion
+# alone (sunlight/HVAC-prone) never justifies HI -- it can only wake + keep a LO probe.
+# Keep-awake/presence is separate (any signal sustains it); this only gates HI. The
+# distance-based HI<->LO hysteresis is unchanged once HI is justified.
+VISION_VOTE_CONF  = 0.50          # min person-detection confidence to count as confirmation
+CONFIRM_TIMEOUT_S = 5.0           # a vision detection confirms presence for this long
+PROXIMITY_PROBE_S = 8.0           # proximity-only HI probe window before demoting to LO
+
 # Distance hysteresis between waking and staying awake. A target must step
 # inside WAKE_DISTANCE_CM to wake the node from SLEEP, but presence is kept
 # alive out to the wider PRESENCE_DISTANCE_CM. The gap stops a target lingering
@@ -678,6 +691,7 @@ def adaptive_vision_streamer():
     # signal; last_person_epoch is the vision vote, refreshed when YOLO sees a person.
     last_presence_epoch = time.time()
     last_person_epoch = 0.0
+    proximity_probe_start = None   # start of a proximity-only HI probe episode (P9)
     wake_signal_epoch = None       # stamped in SLEEP when a wake signal first appears;
                                    # used to time wake-signal -> first inference latency
 
@@ -739,6 +753,19 @@ def adaptive_vision_streamer():
         winding_down = quiet_for > PRESENCE_GRACE_S      # quiet -> cheap LO wind-down
         absent       = quiet_for > PRESENCE_TIMEOUT_S    # quiet long enough -> SLEEP
 
+        # HI-gate confirmation (P9). Vision (a confident person) confirms indefinitely;
+        # proximity grants only a time-limited HI probe and is demoted if vision stays
+        # silent; PIR alone never reaches here. (Presence/keep-awake is separate above --
+        # proximity still sustains the awake state at LO even after the probe expires.)
+        vision_fresh  = (now - last_person_epoch) < CONFIRM_TIMEOUT_S
+        proximity_now = distance < PRESENCE_DISTANCE_CM
+        if not proximity_now or vision_fresh:
+            proximity_probe_start = None          # no object, or vision is carrying it
+        elif proximity_probe_start is None:
+            proximity_probe_start = now           # start of a proximity-only episode
+        probing   = proximity_probe_start is not None and (now - proximity_probe_start) < PROXIMITY_PROBE_S
+        confirmed = vision_fresh or probing
+
         # -----------------------------------------------------------------
         # STEP C: FSM TRANSITIONS (every debounced edge goes through the gate)
         # -----------------------------------------------------------------
@@ -779,12 +806,14 @@ def adaptive_vision_streamer():
             elif winding_down:
                 # Presence quiet: hold cheap LO as the wind-down; do not escalate.
                 gate.clear()
-            elif distance > HILO_FAR_CM:
-                # Present + far -> high-res, debounced by the gate.
+            elif distance > HILO_FAR_CM and confirmed:
+                # Present + far + CONFIRMED -> high-res, debounced by the gate. A PIR-only
+                # (unconfirmed) far reading does NOT escalate -- it stays in the cheap LO
+                # probe, so a false PIR can never reach the expensive HI state (P9).
                 if gate.request(STATE_ACTIVE_HI, now, HILO_HOLD_S, HILO_DWELL_S):
                     current_state = STATE_ACTIVE_HI
                     gate.enter(now)
-                    print("[FSM] ACTIVE-LO -> ACTIVE-HI. Target moved past far threshold.", flush=True)
+                    print("[FSM] ACTIVE-LO -> ACTIVE-HI. Confirmed target past far threshold.", flush=True)
             else:
                 gate.clear()   # crossing condition lapsed -> drop partial confirmation
 
@@ -795,6 +824,13 @@ def adaptive_vision_streamer():
                 current_state = STATE_ACTIVE_LO
                 gate.enter(now)
                 print("[FSM] ACTIVE-HI -> ACTIVE-LO. Presence quiet; low-power wind-down.", flush=True)
+            elif not confirmed:
+                # Held only by PIR (no confident vision, not in proximity) -> the camera
+                # sees nobody despite the motion claim: treat the PIR as unconfirmed and
+                # drop to the cheap LO probe so a false positive can't hold HI (P9).
+                current_state = STATE_ACTIVE_LO
+                gate.enter(now)
+                print("[FSM] ACTIVE-HI -> ACTIVE-LO. Unconfirmed (PIR-only); dropping to probe.", flush=True)
             elif distance < HILO_CLOSE_CM:
                 # Present + close -> low-res, debounced by the gate.
                 if gate.request(STATE_ACTIVE_LO, now, HILO_HOLD_S, HILO_DWELL_S):
@@ -900,7 +936,8 @@ def adaptive_vision_streamer():
 
         # Vision presence vote: a detected person keeps the node awake even with
         # no PIR motion (a motionless-but-visible occupant).
-        if PERSON_CLASS_ID in detected_classes:
+        if any(cid == PERSON_CLASS_ID and conf >= VISION_VOTE_CONF
+               for cid, conf in zip(detected_classes, detected_confidences)):
             last_person_epoch = time.time()
 
         detection_pairs = build_detection_pairs(detected_classes, detected_confidences)
