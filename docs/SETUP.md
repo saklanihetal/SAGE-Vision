@@ -151,7 +151,7 @@ nano rpi_edge/pi_edge_node.py
 The pin constants are at the top of `gpio_harvester_worker`:
 ```python
 PIR_PIN  = 17   # PIR OUT
-LDR_PIN  = 27   # LM393 DO (active-low)
+LDR_PIN  = 27   # LM393 DO (HIGH = dark on this module; see LDR_DARK_LEVEL)
 TRIG_PIN = 23   # HC-SR04 TRIG
 ECHO_PIN = 24   # HC-SR04 ECHO (via divider)
 ```

@@ -29,7 +29,7 @@ STATE_WATCHDOG  = "WATCHDOG"
 # =========================================================================
 # The GPIO harvester thread writes here; the vision/FSM thread reads. Every
 # access is guarded by state_mutex. The LDR is a digital LM393 comparator
-# (active-low), so light is a dark/bright boolean, not an analog value.
+# (a digital comparator), so light is a dark/bright boolean, not an analog value.
 shared_state = {
     "pir": 0,
     "distance": 400.0,            # safe far-distance default until the first echo
@@ -529,7 +529,9 @@ def snapshot_worker():
 # Hardware GPIO pin map (BCM numbering). The HC-SR04 ECHO line is 5V and MUST
 # pass through a resistor voltage divider down to 3.3V before reaching the Pi.
 PIR_PIN  = 17   # PIR digital motion output
-LDR_PIN  = 27   # LM393 light comparator digital output (active-low: LOW = dark)
+LDR_PIN  = 27   # LM393 light comparator digital output
+LDR_DARK_LEVEL = 1   # digital level that means DARK on this module (CLAHE on).
+                     # LM393 polarity varies by module/pot wiring; flip to 0 if inverted.
 TRIG_PIN = 23   # HC-SR04 trigger output
 ECHO_PIN = 24   # HC-SR04 echo input (via 5V -> 3.3V voltage divider)
 
@@ -644,7 +646,7 @@ def gpio_harvester_worker():
             #    NOT health-monitorable: a dead level pin reads a constant value
             #    indistinguishable from a genuinely quiet/lit room.
             pir_val = pi.read(PIR_PIN)
-            is_dark = (pi.read(LDR_PIN) == 0)   # active-low: LOW output = dark
+            is_dark = (pi.read(LDR_PIN) == LDR_DARK_LEVEL)   # dark -> CLAHE on
             with state_mutex:
                 shared_state["pir"] = pir_val
                 shared_state["is_dark"] = is_dark

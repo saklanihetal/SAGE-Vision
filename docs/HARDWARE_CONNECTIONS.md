@@ -40,7 +40,7 @@ The light sensor is now an **LM393 dual-comparator module** that outputs a clean
 
 ### Polarity
 
-This project assumes the module is **active-low**: `DO = LOW` when the room is **dark**, `DO = HIGH` when bright. The code reads `is_dark = (gpio_read == 0)`. Most generic LM393 light modules behave this way; if yours is inverted, adjust the potentiometer or flip the comparison in `gpio_harvester_worker`.
+On this build the module outputs `DO = HIGH` when the room is **dark** and `DO = LOW` when bright, so the code reads `is_dark = (gpio_read == LDR_DARK_LEVEL)` with `LDR_DARK_LEVEL = 1`. LM393 light modules vary by board and pot wiring; if yours is inverted (`DO = LOW` when dark), set `LDR_DARK_LEVEL = 0` (or adjust the potentiometer).
 
 ### Calibration
 

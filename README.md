@@ -39,7 +39,7 @@ The node runs **fully offline on the Pi alone**. Sensors wire directly to the 40
 | Sensor | Signal | Pi pin | Notes |
 |---|---|---|---|
 | HC-SR501 PIR | OUT | GPIO 17 (pin 11) | 5V supply; output already 3.3V-safe |
-| LM393 light | DO | GPIO 27 (pin 13) | 3.3V supply; active-low (LOW = dark); hardware hysteresis via onboard pot |
+| LM393 light | DO | GPIO 27 (pin 13) | 3.3V supply; **HIGH = dark** on this module (LM393 polarity varies — set by `LDR_DARK_LEVEL`); hardware hysteresis via onboard pot |
 | HC-SR04 | TRIG | GPIO 23 (pin 16) | direct connection |
 | HC-SR04 | ECHO | GPIO 24 (pin 18) | **via 1kΩ/2kΩ voltage divider** (steps the 5V echo down to 3.3V) |
 | INA219 | SDA / SCL | GPIO 2 / GPIO 3 (pins 3 / 5) | I²C; address `0x40` |
@@ -129,7 +129,7 @@ Because a full-integer INT8 model bakes its input resolution in at export time, 
 
 ### CLAHE Preprocessing
 
-Orthogonal to the 5 states, the captured frame is enhanced when the LDR reports darkness (LOW output). The BGR frame is converted to YUV and CLAHE is applied to the **Y (brightness) channel only**, leaving chroma (U, V) untouched so colour is not distorted — then converted back.
+Orthogonal to the 5 states, the captured frame is enhanced when the LDR reports darkness (HIGH output on this module). The BGR frame is converted to YUV and CLAHE is applied to the **Y (brightness) channel only**, leaving chroma (U, V) untouched so colour is not distorted — then converted back.
 
 - `tileGridSize = (8, 8)` — splits the frame into an 8×8 grid (64 tiles, ~80×60 px each on a 640×480 frame), equalising each tile against its own local histogram (bilinearly interpolated across tiles to avoid blocky seams).
 - `clipLimit = 2.0` — the contrast cap. The histogram has 256 bins (8-bit Y); OpenCV clips each bin at `clipLimit × (tile_pixels / 256)` ≈ 2× the average bin height (~4800 px/tile ÷ 256 ≈ 19 px → clip at ~38 px), then redistributes the excess. This bounds the slope of the equalisation curve, which stops near-flat dark regions from amplifying sensor noise. `2.0` is a deliberately mild value.
