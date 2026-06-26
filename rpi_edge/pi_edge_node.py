@@ -391,6 +391,12 @@ def _compose_gui(video, record, boxes, detection_pairs):
     _text(header, f"Model {res_str} | Objects: {len(detection_pairs)} | {lat_str} | {fps_str}",
           (8, 43), (255, 255, 255), 0.5, 1)
 
+    # CLAHE low-light state, top-right of the HUD (amber = on, grey = off) for demos.
+    clahe_on = record.get("clahe", False)
+    clahe_str = "CLAHE ON" if clahe_on else "CLAHE OFF"
+    clahe_col = (0, 215, 255) if clahe_on else (120, 120, 120)
+    _text(header, clahe_str, (header.shape[1] - 135, 22), clahe_col, 0.6, 2, outline=True)
+
     pwr = record["power_w"]; pwr_str = f"{pwr:.2f} W" if pwr is not None else "-- W"
     dist = record.get("distance_cm")
     dist_str = f"{dist:.0f} cm" if dist is not None else "n/a"
@@ -822,6 +828,7 @@ def adaptive_vision_streamer():
                 "power_w": read_power_w(),
                 "distance_cm": distance,
                 "fps": fps,
+                "clahe": clahe_active,
                 "detections": [],
             }
             emit_telemetry(idle_record)
@@ -909,6 +916,7 @@ def adaptive_vision_streamer():
             "power_w": read_power_w(),
             "distance_cm": distance,
             "fps": fps,
+            "clahe": clahe_active,
             "detections": detection_pairs,
         }
         emit_telemetry(active_record)
