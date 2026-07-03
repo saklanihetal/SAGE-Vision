@@ -202,10 +202,9 @@ def get_pi_hardware_metrics():
 # =========================================================================
 # One telemetry record (dict) is assembled per loop and fanned out to sinks.
 # The terminal sink prints to the Pi's own console (the node runs fully offline).
-# read_power_w() reads the INA219 (I2C) for whole-Pi 5V-rail power draw (watts);
-# it returns None when the sensor is absent so the node still runs headless.
-# _cloud_sink() is an intentional stub: a non-blocking uploader once the cloud
-# platform is chosen.
+# Whole-Pi power is NOT read in software: it is measured with a standalone inline
+# USB-C power meter on the Pi's 5V feed and logged by hand off its display (see
+# docs/HARDWARE_CONNECTIONS.md), so it never touches this loop.
 
 # YOLOv8 COCO 80-class map (dense indices 0-79, not the sparse 91-class paper IDs).
 COCO_LABELS = {
@@ -226,45 +225,6 @@ COCO_LABELS = {
     70: "Toaster", 71: "Sink", 72: "Refrigerator", 73: "Book/Notebook", 74: "Clock",
     75: "Vase", 76: "Scissors", 77: "Teddy Bear", 78: "Hair Drier", 79: "Toothbrush",
 }
-
-
-# INA219 power monitor — optional. Lazily initialised on the first read so the
-# node runs fine when the sensor is absent (read_power_w() returns None and the
-# telemetry "pwr" column shows "-- W"). See docs/HARDWARE_CONNECTIONS.md Section 4.
-INA219_SHUNT_OHMS = 0.1      # on-board shunt on the GY-219 / Adafruit INA219
-INA219_MAX_AMPS = 3.2        # 320 mV gain over 0.1 Ohm; covers the Pi 4B's peak draw
-_ina219 = None
-_ina219_unavailable = False
-
-
-def read_power_w():
-    """Whole-Pi power draw in watts from the INA219 over I2C.
-
-    The INA219 sits high-side, inline on the Pi's incoming 5 V USB-C feed (see
-    docs/HARDWARE_CONNECTIONS.md, Section 4), so its power register is the total
-    power delivered to the Pi. Returns watts, or None if the sensor is not
-    wired / not responding so telemetry degrades gracefully to "-- W".
-    """
-    global _ina219, _ina219_unavailable
-    if _ina219_unavailable:
-        return None
-    if _ina219 is None:
-        try:
-            from ina219 import INA219
-            _ina219 = INA219(INA219_SHUNT_OHMS, INA219_MAX_AMPS)
-            # 16 V range (the Pi runs at 5 V) + 320 mV gain -> up to 3.2 A at the
-            # finest resolution that still spans the Pi's peak draw.
-            _ina219.configure(_ina219.RANGE_16V, _ina219.GAIN_8_320MV)
-        except Exception as exc:
-            print(f"[PWR] INA219 unavailable ({exc}); power telemetry disabled.", flush=True)
-            _ina219_unavailable = True
-            return None
-    try:
-        return _ina219.power() / 1000.0    # pi-ina219 returns milliwatts
-    except Exception:
-        # e.g. a transient I2C glitch or DeviceRangeError on a current spike;
-        # drop just this sample rather than killing telemetry.
-        return None
 
 
 def build_detection_pairs(class_ids, confidences):
@@ -324,14 +284,12 @@ def cloud_uploader_worker():
             continue
 
         fields = {}
-        if record.get("power_w") is not None:
-            fields["field1"] = f"{record['power_w']:.3f}"     # power (W)
         if record.get("latency_ms") is not None:
-            fields["field2"] = f"{record['latency_ms']:.1f}"  # latency (ms)
+            fields["field1"] = f"{record['latency_ms']:.1f}"  # latency (ms)
         if record.get("cpu_temp_c") is not None:
-            fields["field3"] = f"{record['cpu_temp_c']:.1f}"  # CPU temp (C)
+            fields["field2"] = f"{record['cpu_temp_c']:.1f}"  # CPU temp (C)
         if record.get("distance_cm") is not None:
-            fields["field4"] = f"{record['distance_cm']:.1f}" # distance (cm)
+            fields["field3"] = f"{record['distance_cm']:.1f}" # distance (cm)
         if not fields:
             continue
 
@@ -350,13 +308,11 @@ def _terminal_sink(record):
     res_str = str(res) if res else "---"
     lat = record["latency_ms"]
     lat_str = f"{lat:6.1f}ms" if lat is not None else "    ---  "
-    pwr = record["power_w"]
-    pwr_str = f"{pwr:5.2f}W" if pwr is not None else "  -- W"
     dets = record["detections"]
     det_str = ", ".join(f"{name}({conf:.1f}%)" for name, conf in dets) if dets else "none"
     print(
         f"[{record['ts']}] {record['state']:<9} | model {res_str:<3} | lat {lat_str} | "
-        f"cpu {record['cpu_pct']:4.1f}% | temp {record['cpu_temp_c']:4.1f}C | pwr {pwr_str} | "
+        f"cpu {record['cpu_pct']:4.1f}% | temp {record['cpu_temp_c']:4.1f}C | "
         f"dist {record['distance_cm']:6.1f}cm | dets: {det_str}",
         flush=True,
     )
@@ -410,10 +366,9 @@ def _compose_gui(video, record, boxes, detection_pairs):
     clahe_col = (0, 215, 255) if clahe_on else (120, 120, 120)
     _text(header, clahe_str, (header.shape[1] - 135, 22), clahe_col, 0.6, 2, outline=True)
 
-    pwr = record["power_w"]; pwr_str = f"{pwr:.2f} W" if pwr is not None else "-- W"
     dist = record.get("distance_cm")
     dist_str = f"{dist:.0f} cm" if dist is not None else "n/a"
-    _text(header, f"cpu {record['cpu_pct']:.0f}% | {record['cpu_temp_c']:.0f}C | {pwr_str} | dist {dist_str}",
+    _text(header, f"cpu {record['cpu_pct']:.0f}% | {record['cpu_temp_c']:.0f}C | dist {dist_str}",
           (8, 64), (255, 255, 255), 0.5, 1)
 
     return np.vstack([header, video])
@@ -863,7 +818,6 @@ def adaptive_vision_streamer():
                 "latency_ms": None,
                 "cpu_pct": cpu_pct,
                 "cpu_temp_c": cpu_c,
-                "power_w": read_power_w(),
                 "distance_cm": distance,
                 "fps": fps,
                 "clahe": clahe_active,
@@ -952,7 +906,6 @@ def adaptive_vision_streamer():
             "latency_ms": inference_duration_ms,
             "cpu_pct": cpu_pct,
             "cpu_temp_c": cpu_c,
-            "power_w": read_power_w(),
             "distance_cm": distance,
             "fps": fps,
             "clahe": clahe_active,

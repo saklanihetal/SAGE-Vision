@@ -13,7 +13,9 @@ from yolo_tflite import YoloTFLite
 
 # Baseline is the unoptimised control: fixed 640x640, no sensors, no adaptive
 # switching. It logs the same telemetry fields as the adaptive node (minus the
-# sensor-derived distance) so an energy/latency/thermal comparison is direct.
+# sensor-derived distance) so a latency/thermal comparison is direct. Whole-Pi
+# power is read by hand off the inline USB-C power meter (same meter for both
+# runs), not in software, so the energy comparison shares one instrument.
 MODEL_WEIGHTS_PATH = os.path.join(_RPI_EDGE_DIR, "yolov8n_640_int8.tflite")
 
 # Contiguous YOLOv8 COCO 80-class index map (0-79). IDs are NOT the sparse
@@ -54,35 +56,6 @@ def get_pi_hardware_metrics():
     return psutil.cpu_percent(interval=None), cpu_temp
 
 
-# INA219 power monitor — mirrors pi_edge_node.read_power_w() so the baseline and
-# adaptive energy logs share the same column and the same calibration. Lazily
-# initialised; returns None when the sensor is absent. See HARDWARE_CONNECTIONS.md.
-INA219_SHUNT_OHMS = 0.1
-INA219_MAX_AMPS = 3.2
-_ina219 = None
-_ina219_unavailable = False
-
-
-def read_power_w():
-    """Whole-Pi power draw in watts from the INA219 over I2C (None if absent)."""
-    global _ina219, _ina219_unavailable
-    if _ina219_unavailable:
-        return None
-    if _ina219 is None:
-        try:
-            from ina219 import INA219
-            _ina219 = INA219(INA219_SHUNT_OHMS, INA219_MAX_AMPS)
-            _ina219.configure(_ina219.RANGE_16V, _ina219.GAIN_8_320MV)
-        except Exception as exc:
-            print(f"[PWR] INA219 unavailable ({exc}); power telemetry disabled.", flush=True)
-            _ina219_unavailable = True
-            return None
-    try:
-        return _ina219.power() / 1000.0    # pi-ina219 returns milliwatts
-    except Exception:
-        return None
-
-
 def build_detection_pairs(class_ids, confidences):
     """Map raw YOLO class IDs to (label, confidence%) tuples for logging."""
     pairs = []
@@ -102,13 +75,11 @@ def _terminal_sink(record):
     """Print one telemetry record to the terminal (baseline has no distance)."""
     lat = record["latency_ms"]
     lat_str = f"{lat:6.1f}ms" if lat is not None else "    ---  "
-    pwr = record["power_w"]
-    pwr_str = f"{pwr:5.2f}W" if pwr is not None else "  -- W"
     dets = record["detections"]
     det_str = ", ".join(f"{name}({conf:.1f}%)" for name, conf in dets) if dets else "none"
     print(
         f"[{record['ts']}] {record['state']:<9} | model {record['model_res']:<3} | lat {lat_str} | "
-        f"cpu {record['cpu_pct']:4.1f}% | temp {record['cpu_temp_c']:4.1f}C | pwr {pwr_str} | "
+        f"cpu {record['cpu_pct']:4.1f}% | temp {record['cpu_temp_c']:4.1f}C | "
         f"dets: {det_str}",
         flush=True,
     )
@@ -143,8 +114,7 @@ def _compose_gui(video, record, boxes, detection_pairs):
     fps = record.get("fps"); fps_str = f"{fps:.0f} FPS" if fps else "-- FPS"
     _text(header, f"Model {record['model_res']} | Objects: {len(detection_pairs)} | "
                   f"{record['latency_ms']:.0f} ms | {fps_str}", (8, 43), (255, 255, 255), 0.5, 1)
-    pwr = record["power_w"]; pwr_str = f"{pwr:.2f} W" if pwr is not None else "-- W"
-    _text(header, f"cpu {record['cpu_pct']:.0f}% | {record['cpu_temp_c']:.0f}C | {pwr_str}",
+    _text(header, f"cpu {record['cpu_pct']:.0f}% | {record['cpu_temp_c']:.0f}C",
           (8, 64), (255, 255, 255), 0.5, 1)
     return np.vstack([header, video])
 
@@ -209,7 +179,6 @@ if __name__ == "__main__":
                 "latency_ms": inference_duration_ms,
                 "cpu_pct": cpu_p,
                 "cpu_temp_c": cpu_t,
-                "power_w": read_power_w(),
                 "fps": fps,
                 "detections": detection_pairs,
             }

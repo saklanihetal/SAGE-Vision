@@ -3,20 +3,21 @@
 
 Parses the fixed-format telemetry lines emitted by `rpi_edge/pi_edge_node.py`
 (adaptive) or `test/test_baseline_edge.py` (baseline) and prints the per-run
-metrics for every benchmarking objective: mean CPU, peak temperature, mean
-active-frame latency, time-weighted mean power / energy / Joules-per-detection,
-and time-in-state.
+metrics for every benchmarking objective the software can measure: mean CPU,
+peak temperature, mean active-frame latency, wake latency, and time-in-state.
+
+Whole-Pi power/energy is NOT in the telemetry — it is read by hand off the
+inline USB-C power meter's display during each run (see docs/TESTING.md), so it
+is compared manually, not by this script.
 
 Usage:
     python3 test/analyze_log.py ~/run_baseline.log
     python3 test/analyze_log.py ~/run_adaptive.log
 
 Notes / caveats (see docs/TESTING.md):
-  - Timestamps are 1-second resolution, so duration and energy are approximate.
-  - Power/energy are time-weighted by the gaps between samples (not a flat
-    per-line average), because the loop pace differs by state.
-  - `-- W` (INA219 not wired) and `---` (no inference latency) are treated as
-    missing and excluded from their averages.
+  - Timestamps are 1-second resolution, so duration is approximate.
+  - `---` (no inference latency in SLEEP/STANDBY) is treated as missing and
+    excluded from the latency average.
   - The baseline log has no `dist` field; both formats parse fine.
 """
 
@@ -44,9 +45,6 @@ def parse(path):
                 "lat":   num(r"lat\s+([\d.]+)ms"),
                 "cpu":   num(r"cpu\s+([\d.]+)%"),
                 "temp":  num(r"temp\s+([\d.]+)C"),
-                "pwr":   num(r"pwr\s+([\d.]+)W"),
-                "ndets": 0 if "dets: none" in line else
-                         (len(line.split("dets:")[1].split(",")) if "dets:" in line else 0),
             })
     return rows
 
@@ -75,18 +73,13 @@ def main(path):
     temp = [r["temp"] for r in rows if r["temp"] is not None]
     lat = [r["lat"] for r in rows if r["lat"] is not None]   # active frames only
 
-    # Time-weighted energy + time-in-state, using the timestamp gaps.
+    # Time-in-state, using the timestamp gaps.
     secs = defaultdict(float)
-    energy = 0.0
-    pwr_time = 0.0
     for a, b in zip(rows, rows[1:]):
         dt = b["t"] - a["t"]
         if not (0 <= dt < 30):       # skip gaps / midnight wrap
             continue
         secs[a["state"]] += dt
-        if a["pwr"] is not None:
-            energy += a["pwr"] * dt  # Joules
-            pwr_time += dt
 
     print(f"file              : {path}")
     print(f"samples / duration: {n} lines / {dur} s")
@@ -97,14 +90,7 @@ def main(path):
     wl = wake_latencies(path)
     if wl:
         print(f"wake latency ms   : mean {mean(wl):.0f}, min {min(wl):.0f}, max {max(wl):.0f}  (n={len(wl)})")
-    if pwr_time:
-        print(f"mean power W      : {energy / pwr_time:.2f}  (time-weighted)")
-        print(f"energy J          : {energy:.0f}")
-        tot = sum(r["ndets"] for r in rows)
-        if tot:
-            print(f"J per detection   : {energy / tot:.2f}  (per detection instance)")
-    else:
-        print("mean power W      : n/a (INA219 not wired -> '-- W')")
+    print("power W           : read manually off the inline USB-C meter (not in the log)")
     print("time in state:")
     for s in sorted(secs, key=secs.get, reverse=True):
         pct = 100 * secs[s] / dur if dur else 0

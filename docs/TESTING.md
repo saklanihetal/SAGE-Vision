@@ -10,7 +10,7 @@ Both the baseline and the adaptive node run **entirely on the Pi** and print tel
 
 The experiment is designed to produce empirical evidence for these claims:
 
-1. **Energy reduction** — the adaptive system draws less average power, and fewer Joules per confirmed detection, over a realistic occupancy pattern. *(Requires the optional INA219; see `HARDWARE_CONNECTIONS.md`.)*
+1. **Energy reduction** — the adaptive system draws less average power over a realistic occupancy pattern. *(Requires the optional inline USB-C power meter, read by hand; see `HARDWARE_CONNECTIONS.md`.)*
 2. **CPU reduction** — the adaptive system uses less processor time during idle and low-complexity states.
 3. **Thermal reduction** — the adaptive system holds the BCM2711 SoC at a lower **average / steady-state temperature** than the always-on baseline. (We report average temperature, not throttle events: the test hardware never reached the 80°C throttle point.)
 4. **Latency improvement** — dynamic resolution scaling reduces per-frame inference time when subjects are close, and waking into low-resolution first reduces the wake-up latency (time-to-first-detection after a wake; reported by `analyze_log.py`).
@@ -35,8 +35,9 @@ Two runs are compared:
 - [ ] `pigpiod` running (`sudo systemctl enable --now pigpiod`)
 - [ ] USB web camera connected
 - [ ] Both `.tflite` models present in `rpi_edge/` (`yolov8n_320_int8.tflite`, `yolov8n_640_int8.tflite`)
-- [ ] *(For the energy claim)* INA219 wired inline on the Pi's 5 V USB-C feed, I²C enabled (`i2cdetect -y 1` shows `0x40`), and `pi-ina219` installed
-- [ ] **Both nodes run with `--cloud` and `--snapshots` OFF.** The INA219 measures whole-Pi power, which includes the Wi-Fi radio and SD-card writes; `--cloud` (a Wi-Fi transmit burst every 20 s) and `--snapshots` (JPEG encode + SD write on each detection) add load only the adaptive node would carry — the baseline has neither path — biasing the energy comparison. Reserve both for live demos, never for a measured run.
+- [ ] *(For the energy claim)* the inline USB-C power meter plugged between the charger and the Pi's USB-C port, showing live watts (no GPIO wiring, no software)
+- [ ] **Both nodes run with `--cloud` and `--snapshots` OFF.** The meter measures whole-Pi power, which includes the Wi-Fi radio and SD-card writes; `--cloud` (a Wi-Fi transmit burst every 20 s) and `--snapshots` (JPEG encode + SD write on each detection) add load only the adaptive node would carry — the baseline has neither path — biasing the energy comparison. Reserve both for live demos, never for a measured run.
+- [ ] A way to **note the meter's watts** during each run (paper log, or a phone photo/video of the display at each checkpoint) — power is read by hand, not captured in the telemetry log
 - [ ] A **stopwatch** ready for the ground-truth log
 - [ ] A **physical notepad** for manual object annotations
 - [ ] Room at approximately **25°C ambient**
@@ -72,9 +73,19 @@ python3 <script> --headless | tee ~/run_baseline.log
 
 A captured line looks like:
 ```
-[14:22:07] ACTIVE-LO | model 320 | lat   28.4ms | cpu 47.0% | temp 58.1C | pwr   5.21W | dist   95.3cm | dets: Student/Person(94.2%)
+[14:22:07] ACTIVE-LO | model 320 | lat   28.4ms | cpu 47.0% | temp 58.1C | dist   95.3cm | dets: Student/Person(94.2%)
 ```
-Fields are `|`-delimited with inline labels. `lat` shows `---` in SLEEP/STANDBY (no inference runs there); `pwr` shows `-- W` until the INA219 is wired; the **baseline log has no `dist` field** (it uses no sensors).
+Fields are `|`-delimited with inline labels. `lat` shows `---` in SLEEP/STANDBY (no inference runs there); the **baseline log has no `dist` field** (it uses no sensors). There is **no `pwr` field** — whole-Pi power is read by hand off the inline USB-C meter (see below) and is not in the log.
+
+## Reading power off the inline meter (manual)
+
+Power is the one metric the node does not record — it comes from the **inline USB-C power meter's display** (see `HARDWARE_CONNECTIONS.md`, Section 4). During each run, capture the watts by hand so you can pair them with the run afterwards:
+
+- **Steady-state per state** — glance at the meter each time the FSM settles into a state (SLEEP, ACTIVE-LO, ACTIVE-HI) and note the watts against that state. This is the most useful breakdown: it shows *how much* each state saves.
+- **Run average** — if the meter has a running average / Wh readout, note it at the end; otherwise average your per-state readings weighted by the time-in-state that `analyze_log.py` reports.
+- **Same meter, both runs** — use the identical meter and charger for the baseline and adaptive runs so the comparison shares one instrument.
+
+The cleanest low-effort method is to point a phone camera at the meter's display for the whole run; you can scrub back to any checkpoint afterwards. Record the numbers into the Results table at the end of this document.
 
 ---
 
@@ -195,7 +206,7 @@ grep -oE 'BASELINE|SLEEP|STANDBY|ACTIVE-LO|ACTIVE-HI|WATCHDOG' ~/run_adaptive.lo
 
 ### Full per-run summary (`test/analyze_log.py`)
 
-The repo ships a parser, [`test/analyze_log.py`](../test/analyze_log.py), that prints every objective's metric for one log — it handles both the baseline and adaptive line formats and treats `-- W` / `---` as missing. Run it once per log and compare:
+The repo ships a parser, [`test/analyze_log.py`](../test/analyze_log.py), that prints every log-derived objective's metric for one log — it handles both the baseline and adaptive line formats and treats `---` (idle latency) as missing. Power is not in the log, so it is not in the script's output — pair the meter readings in by hand. Run it once per log and compare:
 
 ```bash
 python3 test/analyze_log.py ~/run_baseline.log
@@ -207,24 +218,23 @@ Example output:
 file              : /home/pi/run_adaptive.log
 samples / duration: 312 lines / 180 s
 mean CPU %        : 41.8
+mean temp C       : 57.2
 max temp C        : 61.4
 mean latency ms   : 33.7  (active frames only)
-mean power W      : 3.95  (time-weighted)
-energy J          : 711
-J per detection   : 1.42  (per detection instance)
+power W           : read manually off the inline USB-C meter (not in the log)
 time in state:
   ACTIVE-LO :   120 s (67%)
   SLEEP     :    40 s (22%)
   ACTIVE-HI :    20 s (11%)
 ```
 
-(The numbers above are illustrative — `pwr`/energy fill in only once the INA219 is wired.)
+(The numbers above are illustrative. Power is not in the log — read it off the meter, then pair it with the time-in-state above to weight a run average.)
 
 ### What each number means (mapped to the objectives)
 
-| Objective | Metric (from the script) | Expected result |
+| Objective | Metric | Expected result |
 |---|---|---|
-| 1. Energy | mean power (W), energy (J), J/detection | adaptive **lower** — time in SLEEP/LO instead of 640 |
+| 1. Energy | mean power (W) — **read off the meter**, weighted by time-in-state | adaptive **lower** — time in SLEEP/LO instead of 640 |
 | 2. CPU | mean CPU % | adaptive lower, driven by idle/LO time |
 | 3. Thermal | mean & max temp °C | adaptive holds a lower average temperature |
 | 4. Latency | mean active latency (ms) | adaptive lower whenever ACTIVE-LO (320) runs |
@@ -235,8 +245,8 @@ time in state:
 
 | Metric | Baseline | Adaptive | Δ |
 |---|---|---|---|
-| Mean power (W) | | | |
-| Energy (J) over run | | | |
+| Mean power (W) — from the meter | | | |
+| Energy (J) over run — mean W × duration (s) | | | |
 | Mean CPU (%) | | | |
 | Mean temp (°C) | | | |
 | Max temp (°C) | | | |
@@ -247,9 +257,8 @@ time in state:
 
 ### Honest caveats
 
-- **Timestamps are 1-second resolution**, so duration and energy are approximate — fine over a multi-minute run, but don't quote them to the millijoule.
-- Power/energy are **time-weighted** by the timestamp gaps (not a flat per-line average), because loop pace differs by state — a per-line mean would let the fast ACTIVE-LO frames dominate.
-- `J per detection` counts detection *instances* across frames (a rough proxy). For *unique confirmed* objects, use the counts from the Ground-Truth Annotation Sheet instead.
+- **Timestamps are 1-second resolution**, so duration and the time-in-state weighting are approximate — fine over a multi-minute run, but don't quote them to the millisecond.
+- **Power is read by hand off the meter**, not logged, so it isn't timestamped to individual frames. Summarise it per state and weight by the time-in-state figures — don't expect frame-level power. For a fair run average, weight each state's watts by its share of the run (not a flat average of your glances), since loop pace and dwell differ by state.
 - Accuracy is judged from the `dets` column against the ground-truth sheet (next section), not by the script.
 
 ---

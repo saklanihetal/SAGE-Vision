@@ -17,7 +17,7 @@ SAGE-Vision makes **compute proportional to scene demand**: cheap sensors gate *
 
 <img width="1536" height="950" alt="System Architecture" src="https://github.com/user-attachments/assets/e013ed95-f943-4051-b0da-51b809678421" />
 
-The node runs **fully offline on the Pi alone**. Sensors wire directly to the 40-pin GPIO header (read by the `pigpio` background process — there is no microcontroller in the live path); a USB camera supplies frames; a two-thread core (sensor harvester + adaptive vision/FSM) does the work, with optional background threads for power/telemetry. Inference runs on `tflite-runtime` with INT8 YOLOv8-nano models.
+The node runs **fully offline on the Pi alone**. Sensors wire directly to the 40-pin GPIO header (read by the `pigpio` background process — there is no microcontroller in the live path); a USB camera supplies frames; a two-thread core (sensor harvester + adaptive vision/FSM) does the work, with optional background threads for telemetry. Inference runs on `tflite-runtime` with INT8 YOLOv8-nano models.
 
 ---
 
@@ -32,7 +32,7 @@ The node runs **fully offline on the Pi alone**. Sensors wire directly to the 40
 | Motion | HC-SR501 PIR | wake / presence signal |
 | Light | LM393 comparator module | dark/bright gate for CLAHE |
 | Distance | HC-SR04 ultrasonic | subject distance → model selection |
-| Power measurement | INA219 | whole-Pi power for the energy figure |
+| Power measurement | Inline USB-C power meter (display) | whole-Pi power for the energy figure — read by hand, off the Pi |
 
 ### Sensor → GPIO wiring (BCM numbering)
 
@@ -42,29 +42,20 @@ The node runs **fully offline on the Pi alone**. Sensors wire directly to the 40
 | LM393 light | DO | GPIO 27 (pin 13) | 3.3V supply; **HIGH = dark** on this module (LM393 polarity varies — set by `LDR_DARK_LEVEL`); hardware hysteresis via onboard pot |
 | HC-SR04 | TRIG | GPIO 23 (pin 16) | direct connection |
 | HC-SR04 | ECHO | GPIO 24 (pin 18) | **via 1kΩ/2kΩ voltage divider** (steps the 5V echo down to 3.3V) |
-| INA219 | SDA / SCL | GPIO 2 / GPIO 3 (pins 3 / 5) | I²C; address `0x40` |
 
 ### Power rails
 
 | Rail | Powers | Pi pins |
 |---|---|---|
 | 5V | HC-SR501, HC-SR04 | 2, 4 |
-| 3.3V | LM393, INA219 (logic) | 1, 17 |
+| 3.3V | LM393 | 1, 17 |
 | GND | all sensor grounds + divider leg | 6, 9, 14, 20, 25, 30, 34, 39 |
 
-### INA219 power-measurement path
+### Power measurement (external, off the Pi)
 
-The INA219 sits high-side, inline on the Pi's 5V USB-C feed, broken out with a female + male USB-C breakout pair so no cable is cut.
+Whole-Pi power is measured with a **standalone inline USB-C power meter** that plugs between the wall charger and the Pi's USB-C power port and shows live volts/amps/watts on its own display. It taps nothing on the GPIO header and runs no code — the watts are **read by hand off its display** and noted alongside each benchmark run. This replaces the earlier INA219 shunt rig (no soldering, no CC-resistor bring-up, no I²C).
 
-| Connection | From → To |
-|---|---|
-| Shunt in | female USB-C `VBUS` → INA219 `VIN+` |
-| Shunt out | INA219 `VIN-` → male USB-C `V+` |
-| Ground | female `GND` → male `G` (common) |
-| CC pull-downs | 5.1kΩ from CC1→GND and CC2→GND on the female board (so the charger enables VBUS) |
-| Logic | `VCC`→3.3V, `GND`→GND, `SDA`→GPIO 2, `SCL`→GPIO 3 |
-
-> Full wiring, soldering, and bring-up steps are in [`docs/HARDWARE_CONNECTIONS.md`](docs/HARDWARE_CONNECTIONS.md).
+> See [`docs/HARDWARE_CONNECTIONS.md`](docs/HARDWARE_CONNECTIONS.md) for the meter placement, and [`docs/TESTING.md`](docs/TESTING.md) for how power is logged during a run.
 
 ---
 
@@ -180,22 +171,21 @@ Every loop the vision thread assembles **one telemetry record** (a dict) and fan
 | `model_res` | inference resolution / model used (`320`, `640`, or `---` when idle) |
 | `latency_ms` | per-frame inference duration |
 | `cpu_pct`, `cpu_temp_c` | CPU utilisation % and core temperature °C |
-| `power_w` | whole-Pi power draw (INA219 over I²C; `-- W` until the sensor is wired) |
 | `distance_cm` | median ultrasonic distance |
 | `detections` | list of `(label, confidence%)` |
 
 The default sink is the **terminal sink**, which prints one fixed-format line per loop to the Pi's own console — so the system runs fully offline:
 
 ```
-[14:22:07] ACTIVE-LO | model 320 | lat   28.4ms | cpu 47.0% | temp 58.1C | pwr  -- W | dist   95.3cm | dets: Student/Person(94.2%)
+[14:22:07] ACTIVE-LO | model 320 | lat   28.4ms | cpu 47.0% | temp 58.1C | dist   95.3cm | dets: Student/Person(94.2%)
 ```
 
 ### Optional sinks (off by default)
 
-- **`--cloud`** — a background thread POSTs power / latency / CPU-temp / distance to a ThingSpeak channel every 20 s (the free-tier rate limit). `emit_telemetry()` only stashes the latest record, so the network call never runs in the inference loop. The write key is read from a git-ignored `.env`. See [`docs/SETUP.md`](docs/SETUP.md), Phase 4.
+- **`--cloud`** — a background thread POSTs latency / CPU-temp / distance to a ThingSpeak channel every 20 s (the free-tier rate limit). `emit_telemetry()` only stashes the latest record, so the network call never runs in the inference loop. The write key is read from a git-ignored `.env`. See [`docs/SETUP.md`](docs/SETUP.md), Phase 4.
 - **`--snapshots`** — on a person detection, a worker thread writes a JPEG of the frame to `./snapshots/` (ring-buffered to a file cap, filename carries timestamp/class/conf/state).
 
-> Both are opt-in and add Wi-Fi/disk activity, so keep them **off during measured benchmark runs** (they would bias the INA219's whole-Pi reading).
+> Both are opt-in and add Wi-Fi/disk activity, so keep them **off during measured benchmark runs** (they would bias the meter's whole-Pi reading).
 
 ### On-Pi GUI (demo)
 
@@ -204,7 +194,7 @@ For demos the node opens a local window on the Pi's HDMI monitor (default; pass 
 ```
 SAGE-Vision   ACTIVE-LO            ← state name colour-coded (green active / grey idle / red watchdog)
 Model 320 | Objects: 3 | 28 ms | 31 FPS
-cpu 47% | 58C | -- W | dist 95 cm
+cpu 47% | 58C | dist 95 cm
 ```
 
 During SLEEP/STANDBY the video area shows a "SYSTEM IDLE" placeholder. Keys: **`q`** quits cleanly, **`f`** toggles fullscreen. The GUI runs inside the vision thread (Cores 2 & 3) and adds negligible cost.
@@ -213,7 +203,7 @@ During SLEEP/STANDBY the video area shows a "SYSTEM IDLE" placeholder. Keys: **`
 
 ## Power Measurement
 
-The headline metric — energy draw — is measured with an **INA219** sitting high-side, inline on the Pi's incoming 5V USB-C feed (see [Hardware & Wiring](#hardware--wiring)), so it reads the **whole-Pi** power draw over I²C. The reading fills the `power_w` telemetry column (watts), and reads `-- W` until the sensor is wired. The node runs fine without it — power instrumentation is only for benchmarking.
+The headline metric — energy draw — is measured with a **standalone inline USB-C power meter** on the Pi's incoming 5V USB-C feed (see [Hardware & Wiring](#hardware--wiring)), so it reads the **whole-Pi** power draw. The meter shows live watts on its own display; the value is **read by hand and logged alongside each benchmark run** rather than flowing through the telemetry — the node itself does no power sensing. Power instrumentation is only for benchmarking; the node runs identically without the meter.
 
 ---
 
@@ -255,7 +245,7 @@ The node measures the **deterministic** part — `T_confirm + T_warmup + T_infer
 - **PIR and LDR are not health-monitorable** — a dead pin reads as a quiet/lit room and is invisible to the WATCHDOG (only the ultrasonic sensor is observable). An *out-of-range* echo (an empty room) still returns a valid pulse and counts as healthy.
 - `is_dark` has **no software debounce**, so CLAHE can toggle frame-to-frame at the light threshold (it relies on the LM393's hardware hysteresis).
 - The median distance filter adds ~0.12 s of lag (accepted for stability).
-- The energy benefit is **not yet proven** — it requires the INA219 rig built and a controlled measurement run against the baseline.
+- The energy benefit is **not yet proven** — it requires a controlled measurement run against the baseline, with whole-Pi watts read off the inline USB-C meter for both.
 
 ---
 
@@ -281,7 +271,7 @@ SAGE-Vision/
 ├── docs/
 │   ├── SETUP.md                           # Installation and execution guide
 │   ├── TESTING.md                         # Benchmarking and validation procedure
-│   ├── HARDWARE_CONNECTIONS.md            # Wiring tables for all sensors + INA219
+│   ├── HARDWARE_CONNECTIONS.md            # Wiring tables for all sensors + power-meter placement
 │   └── ENGINEERING_LOG.md                 # Problems faced, solutions, tradeoffs, limitations
 ├── snapshots/                             # Detection JPEGs (created at runtime; git-ignored)
 ├── .env.example                           # Template for the ThingSpeak key (copy to .env)
@@ -292,7 +282,7 @@ SAGE-Vision/
 ### Documentation
 
 - [docs/SETUP.md](docs/SETUP.md) — installation and execution (HDMI or VNC display), plus the optional `--cloud` setup.
-- [docs/HARDWARE_CONNECTIONS.md](docs/HARDWARE_CONNECTIONS.md) — full wiring for every sensor and the INA219 power rig.
+- [docs/HARDWARE_CONNECTIONS.md](docs/HARDWARE_CONNECTIONS.md) — full wiring for every sensor and where the inline USB-C power meter goes.
 - [docs/TESTING.md](docs/TESTING.md) — benchmarking the adaptive node against the baseline.
 
 ---

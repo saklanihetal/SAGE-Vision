@@ -1,6 +1,6 @@
 # SAGE-Vision — Hardware Connections
 
-This document covers every physical wire that needs to be made for the project. Work through each section in order. The four sensor sections need **no soldering** — they use jumper wires onto the Raspberry Pi's 40-pin GPIO header. The **only** soldering in the build is the *optional* INA219 power-telemetry rig in Section 4 (two header strips, two CC resistors, and a couple of wires onto the USB-C male breakout); skip Section 4 entirely if you don't need power logging.
+This document covers every physical wire that needs to be made for the project. Work through each section in order. **No soldering is required** — the sensors use jumper wires onto the Raspberry Pi's 40-pin GPIO header, and power is measured with a plug-in inline USB-C meter (Section 4) that needs no wiring at all.
 
 > **Architecture note:** The sensors now wire **directly to the Raspberry Pi 4B GPIO header**. The Pi reads the PIR, the LM393 light comparator, and the HC-SR04 ultrasonic sensor itself (via the `pigpio` daemon), so there is no longer an ESP32 microcontroller in the live data path. The original ESP32 firmware is retained under `firmware/` as **legacy** only — see the note at the end of this document.
 
@@ -116,145 +116,40 @@ Values above 500 cm or below 0 are clamped to -1.0 (out of range). A *completed*
 
 ---
 
-## Section 4: INA219 Power Monitor (Optional — Power Telemetry)
+## Section 4: Power Measurement (Optional — Inline USB-C Meter)
 
-> **This is the only soldering in the build.** It is **optional** — the system runs fine without it and the telemetry `power_w` field reads `-- W` until it is wired. It exists to log whole-Pi power draw for the energy comparison between the adaptive node and the baseline.
+> **No wiring and no soldering.** Power measurement is **optional** — the node runs identically without it. It exists only to log whole-Pi power draw for the energy comparison between the adaptive node and the baseline.
 
-The INA219 is an I²C current/voltage/power sensor that measures current as the drop across an external **0.1 Ω shunt** (already on-board on the GY-219 / Adafruit modules). We measure **whole-Pi power** by sitting it **high-side, inline on the Pi's incoming 5 V USB-C feed**, so it sees the Pi's total draw.
+Whole-Pi power is measured with a **standalone inline USB-C power meter** — the kind that has a USB-C plug on one end, a USB-C socket on the other, and a small display showing live **volts / amps / watts**. It sits **inline on the Pi's incoming 5 V USB-C feed**, so it reads the Pi's total draw.
 
-### Why two USB-C breakout boards (instead of an INA260 / cutting a cable)
-
-To get inline on the 5 V feed without slicing a USB-C cable, the supply is broken out at both ends and `VBUS` is routed *through* the INA219 shunt between them (`GND` passes straight through):
-
-- **Female USB-C breakout** (receptacle) — the wall charger / Pi PSU cable plugs **into** this. It is the **sink** side, exposes `VBUS, GND, CC1, CC2, D+, D-` on a 0.1″ header, and is mostly plug-in once its header strip is soldered on.
-- **Male USB-C breakout** (plug) — plugs **into the Pi's USB-C power port**. It presents four **flat SMD pads** labelled `V+, D−, D+, G` (**no holes, no header**), so you solder wires directly onto `V+` and `G`. It carries **no CC pins** — which is exactly why the Rd resistors must live on the female board (see the CC note).
-
-This is non-destructive and reversible, and it replaces the earlier (stubbed) INA260-on-a-bench-supply plan.
-
-### Topology
+### Placement
 
 ```
   5 V USB-C charger / official Pi PSU
             │  (USB-C cable)
             ▼
  ┌──────────────────────────┐
- │  FEMALE USB-C breakout    │   ← charger plugs in here (the "sink")
- │  CC1 ──[5.1 kΩ]── GND     │   ← Rd resistors YOU add (see CC note)
- │  CC2 ──[5.1 kΩ]── GND     │
- │  D+ / D-  : unconnected   │
- └────┬─────────────────┬────┘
-   VBUS │            GND │
-        ▼                │
-   ┌─────────────┐       │
-   │   INA219    │       │
-   │  VIN+ ◄─────┘ (VBUS in from female board)
-   │   [ 0.1 Ω shunt ]   │
-   │  VIN- ──────┐       │
-   │  VCC SDA SCL│ GND   │  ← logic side → Pi 40-pin header (below)
-   └─────────────┘       │
-        │ (to male V+)   │
-        ▼                ▼
- ┌──────────────────────────┐
- │  MALE USB-C breakout      │   V+ ◄ from INA219 VIN-
- │  (flat pads V+ D- D+ G)   │   G  ◄ common ground (from female GND)
- │  D- / D+  : unconnected   │
+ │  Inline USB-C power meter │   ← reads V / A / W on its own display
  └────────────┬─────────────┘
               │  (plugs into the Pi's USB-C power input)
               ▼
         Raspberry Pi 4B
 ```
 
-### Wiring Tables
+1. Unplug the Pi's USB-C power.
+2. Plug the meter's **male (plug)** end into the Pi's USB-C power port.
+3. Plug the charger's USB-C cable into the meter's **female (socket)** end.
+4. Power on — the meter lights up and shows the live draw.
 
-**High-current path (the 5 V feed — `VBUS` passes through the shunt):**
+If the meter has a direction/orientation marking, follow it; a good meter is bidirectional and works either way. Some cheaper units add a small series resistance — if the Pi shows an under-voltage warning (`vcgencmd get_throttled` non-zero, or the on-screen lightning-bolt), try a shorter high-quality cable or a beefier charger.
 
-| From | To | Notes |
-|---|---|---|
-| Female breakout `VBUS` | INA219 `VIN+` | full Pi current — see the wire note below |
-| INA219 `VIN-` | Male breakout `V+` | full Pi current |
-| Female breakout `GND` | Male breakout `G` | common ground, straight through |
-| Female breakout `GND` | INA219 `GND` (logic) | shared with the Pi GND below |
+### Logging power
 
-**INA219 logic side → Pi 40-pin header:**
+Power is **read by hand off the meter's display** and noted against each run — the node does no power sensing and its telemetry has **no power column**. For a benchmark, watch the meter through the run and record either the steady-state watts per state or an eyeballed average (a meter with a running Wh/average readout makes this easier). Use the **same meter for both** the baseline and adaptive runs so the two share one instrument. See `docs/TESTING.md` for exactly when to read it during the activity schedule.
 
-| INA219 Pin | Connects to | Pi Header |
-|---|---|---|
-| VCC | 3.3 V (logic) | pin 1 |
-| GND | Ground | pin 6 (same ground as the feed above) |
-| SDA | I²C data | GPIO 2 (pin 3) |
-| SCL | I²C clock | GPIO 3 (pin 5) |
+### Why an off-the-shelf meter (vs the earlier INA219 shunt rig)
 
-> **⚠ Polarity:** swapping `V+` and `GND` anywhere on the 5 V path feeds reverse voltage straight into the Pi and will destroy it. Verify with a multimeter before the Pi is ever connected.
-
-### Wire note — *using standard jumper wire on the 5 V path*
-
-The `VBUS` / `V+` / `GND` connections carry the Pi's whole current. The Pi 4B draws only ~1–1.5 A in normal operation (camera + inference) — well within standard dupont jumper wire — but it can spike toward **~3 A on boot/heavy load**, where thin jumper wire and friction-fit crimps get marginal. Three mitigations (no thick wire needed):
-
-1. Keep the high-current jumpers **as short as possible**.
-2. **Double them up** — run two strands in parallel for each of `VBUS`, `V+`, and `GND`.
-3. On the male board, **snip the dupont connector off and solder the bare strands directly** to the `V+`/`G` pads — the crimp contact, not the wire, is the weak point at peak current.
-
-After power-up, check `vcgencmd get_throttled` (or watch for the on-screen lightning-bolt): a non-zero under-voltage bit means the path is dropping too much — shorten or double the wires.
-
-> Wire resistance *before* the shunt does **not** corrupt the current reading (the shunt measures current regardless), and bus voltage is sensed on the load side at `VIN-`, so accuracy holds; the concern above is purely thermal / brown-out.
-
-### CC note — *why the Rd resistors are mandatory*
-
-A compliant USB-C source (the official Pi PSU included) will **not** turn on `VBUS` until it detects a sink, and it detects one by seeing an **Rd = 5.1 kΩ pull-down to GND on the CC line(s)**. Normally the powered device presents Rd — but our **male breakout doesn't pass the CC pins through to the Pi**, so the Pi's own Rd never reaches the charger. Without help the charger sees an open CC, assumes nothing is plugged in, and delivers **0 V**.
-
-Fix: present Rd ourselves on the **female** (sink) board — **one 5.1 kΩ resistor from CC1 → GND and one from CC2 → GND**. Because the female board has a 0.1″ header you can do this without soldering the board itself (bridge each resistor between a CC and a GND header pin); soldering it on permanently is cleaner if you prefer. (Both CC lines get an Rd; a real cable connects only one CC through, so the source sees a single Rd — standard sink behaviour, *not* a debug-accessory.) `D+`/`D-` stay unconnected on both boards — this is a power-only tap; the Pi's USB-C port carries no data.
-
-### Soldering — materials
-
-- Fine-tip soldering iron (~350 °C), 60/40 or lead-free solder, and flux
-- Standard jumper wire (snip the connector off where you solder to a pad)
-- Two **5.1 kΩ, ¼ W** resistors (the Rd pull-downs)
-- The header strips that came loose with the INA219 and the female breakout
-- Wire strippers, a vise / helping-hands, heat-shrink (and optionally hot glue for strain relief)
-- A multimeter (continuity + voltage) — **not optional** for the pre-power checks
-
-### Soldering — INA219 module (header strip for logic; screw terminals for the shunt)
-
-The module's **logic side** (`VCC, GND, SCL, SDA`) ships with its header strip loose (that's the "pins not held in the holes" wobble). Push the strip's **short legs** down through the holes from the top so the long pins stick up for jumpers, hold it flush, flip the board, and solder each pin on the back — one joint per pin. Then jumper those four to the Pi header (tiny current — dupont is fine).
-
-The **shunt side** (`VIN+`, `VIN−`) is a **screw terminal block** — *use it, not the pins.* It's the solid, low-resistance, mechanically locked connection the full-current 5 V feed wants, and it keeps any friction-fit crimp out of the highest-current path. Strip ~6–7 mm of wire, insert, tighten the screw, and tug-test:
-- `VIN+` ← wire from the female breakout `VBUS`
-- `VIN−` → wire to the male breakout `V+`
-
-(Don't connect both the screw terminal and the header pin for a given VIN — same node, just use the screw.)
-
-### Soldering — FEMALE breakout (header strip + Rd)
-
-1. If its header strip is loose, solder it in the same way (short legs through, solder on the back).
-2. **Rd resistors:** connect a 5.1 kΩ from `CC1` → `GND` and another from `CC2` → `GND` (at the header per the CC note, or soldered on). Insulate the bare leads so they can't touch `VBUS`.
-3. Bring `VBUS` and `GND` out to the INA219 / male board (see the wire note — short, doubled). `D+`/`D-` stay unconnected.
-4. **Verify (multimeter):** `CC1`→`GND` ≈ 5.1 kΩ, `CC2`→`GND` ≈ 5.1 kΩ, `VBUS`→`GND` **open** (no short).
-
-### Soldering — MALE breakout (flat pads — direct wire)
-
-The four pads (`V+, D−, D+, G`) are flat SMD pads with no holes, so header pins can't seat — solder wire straight to the pads. You only need `V+` and `G`.
-
-1. Clamp the board in a vise, pads up.
-2. **Pre-tin the `V+` and `G` pads:** touch the iron + a little solder so each pad wears a thin shiny dome.
-3. **Pre-tin the wire:** strip ~5 mm of jumper wire (connector snipped off), twist the strands, tin them.
-4. **`V+` joint:** lay the tinned wire flat on the tinned `V+` pad, press the iron down until both pools merge, remove the iron, and **hold the wire dead still ~2 s** while it solidifies. This wire runs to the INA219 `VIN−`.
-5. **`G` joint:** repeat for the `G` pad → common ground (female `GND` / Pi `GND`).
-6. Leave `D−` and `D+` unconnected; don't touch the fine pin-comb beside the pads (that's the connector's own contacts).
-7. **Strain-relief** each joint with heat-shrink, and optionally anchor the wires to the board edge with hot glue so flexing never stresses the pads.
-8. **Inspect:** a good joint is shiny with a concave fillet, not a dull grey ball — re-flow anything blobby.
-9. **Verify (multimeter):** `V+`→`G` reads **open** (you didn't bridge them). Dry-fit the plug into the Pi's USB-C port to confirm it seats before any power.
-
-### Bring-up sequence (in order)
-
-1. Enable I²C: `sudo raspi-config` → *Interface Options* → *I2C* → enable, then reboot.
-2. With the **Pi still disconnected** (male plug out), plug the charger into the female board and measure `VBUS`→`GND` on the female board — it should read **~5 V**. If it reads ~0 V, the Rd resistors are missing/wrong; fix before continuing.
-3. Power off. Connect the male plug into the Pi's USB-C port and boot.
-4. Confirm the chip is on the bus: `sudo i2cdetect -y 1` shows the INA219 at **`0x40`** (default address).
-5. `read_power_w()` in `pi_edge_node.py` reads it via the `pi-ina219` library (see `rpi_edge/requirements.txt`) and fills the `power_w` telemetry column.
-
-### Ratings & headroom
-
-The 0.1 Ω shunt at the INA219's 320 mV gain tops out at **3.2 A**, and the 7Semi female breakout is rated ~1.5 A nominal / 3 A peak. A Pi 4B with the camera sits well under that normally but can spike toward ~3 A on boot — **thin headroom**. Don't hang power-hungry USB peripherals off the Pi while measuring, and keep the high-current wires short (see the wire note).
+An earlier revision measured power with an INA219 shunt sensor tapped onto a pair of USB-C breakout boards over I²C. The inline meter replaces it entirely because it needs **no soldering, no CC-resistor bring-up, no I²C wiring, and no software** — you plug it in and read the number. The tradeoff is that the reading is **manual and off-device** (not timestamped into the telemetry), so power can't be correlated frame-by-frame with FSM state — only summarised per run. For the energy headline (average watts over a run) that is sufficient. See `docs/ENGINEERING_LOG.md` (P7) for the reasoning.
 
 ---
 
@@ -284,8 +179,6 @@ ls /dev/video*
 | GPIO 27 | 13 | Light digital input | LM393 DO | Direct connection (LM393 powered at 3.3V) |
 | GPIO 23 | 16 | Ultrasonic trigger output | HC-SR04 TRIG | Direct connection |
 | GPIO 24 | 18 | Ultrasonic echo input | HC-SR04 ECHO (via divider) | Must use 1kΩ/2kΩ voltage divider |
-| GPIO 2 | 3 | I²C data (SDA) | INA219 SDA | Optional power monitor |
-| GPIO 3 | 5 | I²C clock (SCL) | INA219 SCL | Optional power monitor |
 
 > The sensor pins are defined as constants at the top of `gpio_harvester_worker` in `rpi_edge/pi_edge_node.py` (`PIR_PIN`, `LDR_PIN`, `TRIG_PIN`, `ECHO_PIN`). If you wire to different pins, change them there to match.
 
@@ -323,7 +216,7 @@ Before powering the system on, verify:
 - [ ] All GND connections share the same ground rail (sensor grounds + Pi GND)
 - [ ] USB camera plugged into a Pi USB port
 - [ ] HDMI monitor connected (for the demo GUI; skip if running `--headless`)
-- [ ] *(Optional)* INA219 VCC→3.3V, GND→GND, SDA→GPIO 2, SCL→GPIO 3; VIN+ from female `VBUS`, VIN− to male `V+`; 5.1 kΩ Rd on CC1/CC2; verified ~5 V at the female board before connecting the Pi
+- [ ] *(Optional)* Inline USB-C power meter plugged between the charger and the Pi's USB-C port (no GPIO wiring)
 - [ ] No bare wire ends that could short against the header or the board
 
 ---

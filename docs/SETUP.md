@@ -15,7 +15,7 @@ This document covers everything from flashing the OS to running the live pipelin
   - LM393 light comparator module — DO → **GPIO 27** (powered from 3.3V)
   - HC-SR501 PIR Motion Sensor — OUT → **GPIO 17**
   - HC-SR04 Ultrasonic Sensor — Trigger → **GPIO 23**, Echo → **GPIO 24** *(via 1 kΩ / 2 kΩ voltage divider to step the 5V echo line down to 3.3V)*
-  - *(Optional, for power telemetry)* INA219 power monitor inline on the Pi's 5V USB-C feed over I2C
+  - *(Optional, for the energy benchmark)* a plug-in inline USB-C power meter on the Pi's 5V feed — read by hand, no GPIO wiring or software
 
 > The sensors connect to the Pi directly — there is **no ESP32 in the live pipeline**. The original ESP32 firmware is retained under `firmware/` as legacy only and is not part of setup. The system runs **fully offline on the Pi alone** — no second machine is involved in live operation.
 
@@ -161,14 +161,15 @@ Edit them to match your wiring, then save: `Ctrl+O` → `Enter` → `Ctrl+X`.
 
 By default the node is fully offline. To additionally stream telemetry to a [ThingSpeak](https://thingspeak.com) channel, set it up once:
 
-1. **Create a ThingSpeak channel** with four fields, named to match the upload mapping:
+1. **Create a ThingSpeak channel** with three fields, named to match the upload mapping:
 
    | Field | Name | Unit |
    |---|---|---|
-   | Field 1 | Power | W |
-   | Field 2 | Latency | ms |
-   | Field 3 | CPU temp | °C |
-   | Field 4 | Distance | cm |
+   | Field 1 | Latency | ms |
+   | Field 2 | CPU temp | °C |
+   | Field 3 | Distance | cm |
+
+   > Power is **not** uploaded — it is read by hand off the inline USB-C meter (see `HARDWARE_CONNECTIONS.md`).
 
 2. **Copy the channel's Write API Key** (channel → *API Keys* tab).
 3. **Create the `.env` file** on the Pi from the committed template and paste your key in. It can live in the **project root** or in **`rpi_edge/`** — the loader checks the root first, then `rpi_edge/`:
