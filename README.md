@@ -87,10 +87,7 @@ This bounds the cost of any single false positive (a spurious PIR from sunlight)
 
 Inference is controlled through a 5-state finite state machine.
 
-<img width="1619" height="972" alt="5 state fsm" src="https://github.com/user-attachments/assets/7e3044b8-8719-41cb-9517-a6dd5209a878" />
-
-> **Diagram note (pending re-render):** the **SLEEP → STANDBY** and **ACTIVE-LO → SLEEP** edges are gated by a sonar **deviation from the learned background**, not the old absolute `distance < WAKE_DISTANCE_CM` / `distance < PRESENCE_DISTANCE_CM` labels (P10). Read the wake edge as *"PIR ∨ sonar-deviation > 45 cm"* and the sleep edge as *"all presence signals quiet 12 s (sonar reads its background)."*
-
+<img width="1536" height="1024" alt="state diagram" src="https://github.com/user-attachments/assets/7ed6ef6c-069a-4ba8-8faa-61dcaa48797a" />
 
 1. **SLEEP** — no inference; the loop polls at ~0.5 s watching for a wake signal. Exits to **STANDBY** when the PIR fires or the ultrasonic reading **deviates from the learned background by more than `SONAR_WAKE_DELTA_CM`** (~45 cm — a real change in the scene, not a constant echo), held long enough to pass the debounce gate.
 2. **STANDBY** — a transitional state entered on waking; no inference. Polls fast (~0.05 s) to clear a brief warm-up (`STANDBY_WARMUP_S`, ~200 ms), then **always enters ACTIVE-LO** (it no longer branches on distance — see ACTIVE-LO for why).
