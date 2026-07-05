@@ -1,147 +1,303 @@
-# JaankaarAI — Multimodal Multilingual Regional Fake News Detection
+# SAGE-Vision
+### Sensor-Adaptive GPU-less Edge Vision
 
-JaankaarAI is a multimodal, multilingual fake news verification system built for Indian regional-language content. It goes beyond plain text classification by combining **text analysis, live evidence retrieval, natural language inference, and image forensics** to decide whether a news claim is `SUPPORTED`, `CONTRADICTED`, or `UNVERIFIED`.
+A Raspberry Pi 4B edge application that uses PIR, light (LDR), and ultrasonic sensors to throttle YOLOv8 inference resolution and frame rate — reducing idle power draw and CPU/SoC thermals, without a GPU and without sacrificing detection quality.
 
-Misinformation on social media rarely comes as text alone — it's often paired with unrelated, out-of-context, or manipulated images to make the claim more convincing. JaankaarAI is designed to catch both angles at once: what the text says, and whether the accompanying image actually backs it up.
+---
 
-## Description
+## The Problem
 
-Automated fact-checking tools overwhelmingly target English and a handful of high-resource languages, leaving a large gap for the regional-language content that circulates widely on Indian social media. JaankaarAI addresses that gap with an end-to-end verification pipeline: a user submits a claim (text, and optionally an image or audio clip) in any supported language, the system translates and retrieves live, related news evidence, cross-checks the claim against that evidence with NLI models, verifies the image separately for manipulation and text-image consistency, and fuses all of these signals through trained gating classifiers into a final, explainable verdict. The goal is not just a fake/real label but a verdict a user can audit, backed by the actual articles retrieved and the individual model scores that produced it.
+Running a continuous, fixed-resolution computer-vision loop on an ARM SoC like the Raspberry Pi 4B keeps the CPU under sustained load — drawing high power and holding the SoC at an elevated temperature for the entire session — even though most of the time the scene is empty or static. The usual fixes (a heatsink, an AI-accelerator hat, or a weaker model) either add hardware cost or sacrifice accuracy.
 
-## Features
+SAGE-Vision makes **compute proportional to scene demand**: cheap sensors gate *when* and *how hard* the YOLO model runs, so the node idles near-free when nothing is happening and scales inference resolution to subject distance when it is. The target is a measurable reduction in **average power draw and core temperature** versus an always-on baseline, with no meaningful loss in detection quality — at zero additional hardware cost beyond sensors already on the bench.
 
-- **Multilingual input** — language detection and translation (NLLB / Google Translate) so regional-language claims are verified in a common pipeline alongside English.
-- **Live evidence retrieval** — automatic keyword/query extraction and retrieval of related, real-time news from NewsAPI, EventRegistry, NewsData, and Google RSS.
-- **Semantic ranking & NLI** — evidence is ranked with LaBSE embeddings and checked for entailment/contradiction against the claim using BART-Large-MNLI.
-- **Multimodal verification** — CLIP-based image-text consistency scoring, a CNN deepfake detector, and AWS Rekognition for entity/celebrity/label recognition.
-- **Gated decision fusion** — trained support and contradiction gates (scikit-learn) combine all signals into a single confidence-scored verdict, with a TF-IDF stylometry model as an auxiliary text-only signal.
-- **Audio support** — Whisper-based transcription/translation for audio claims, and gTTS for reading results aloud.
-- **Streamlit UI** — a two-page app (Landing + Detector) with a full explainability panel showing every underlying signal.
+---
 
-## How the Pipeline Works
+## System Overview
 
-A claim submitted to JaankaarAI (text, optionally with an image and/or audio) moves through six stages before a verdict is shown:
+<img width="1536" height="950" alt="System Architecture" src="docs/system_architecture.png" />
 
-### 1. Input Ingestion & Preprocessing
-The claim text (or Whisper-transcribed audio) is language-detected. If it isn't already in English, it's translated using NLLB / Google Translate so every downstream model operates on a common language, while the original regional-language text is preserved and shown back to the user for transparency.
+The node runs **fully offline on the Pi alone**. Sensors wire directly to the 40-pin GPIO header (read by the `pigpio` background process — there is no microcontroller in the live path); a USB camera supplies frames; a two-thread core (sensor harvester + adaptive vision/FSM) does the work, with optional background threads for telemetry. Inference runs on `tflite-runtime` with INT8 YOLOv8-nano models.
 
-### 2. Query Generation & Evidence Retrieval
-Keywords and named entities are extracted from the (translated) claim to build one or more search queries. These queries are sent out in parallel to live news sources — NewsAPI, EventRegistry, NewsData, and Google News RSS — to pull back a set of recent, related articles. This step grounds the verdict in current, real-world reporting instead of relying only on a static training set.
+---
 
-### 3. Evidence Ranking & Natural Language Inference
-Each retrieved article is embedded with LaBSE and ranked by semantic similarity (relevance) to the claim. The most relevant articles are then passed, together with the claim, into a BART-Large-MNLI natural language inference model, which scores each claim-evidence pair as entailment (supports), contradiction, or neutral. This produces a distribution of relevance, entailment, and contradiction scores across all retrieved evidence rather than a single article's opinion.
+## Hardware & Wiring
 
-### 4. Multimodal Verification
-If an image is attached, CLIP measures how consistent the image is with the claim text (catching cases where a real photo is reused with an unrelated caption). A CNN-based deepfake detector separately scores the likelihood the image itself has been manipulated. AWS Rekognition identifies recognizable faces, celebrities, and objects in the image, which helps flag identity mismatches (for example, a claim about one public figure illustrated with a photo of someone else).
+### Components
 
-### 5. Decision Fusion & Gated Classification
-All of the signals gathered so far — relevance/entailment/contradiction statistics from stage 3, CLIP and deepfake scores from stage 4, plus TF-IDF stylometry and lexicon-based writing-style signals — are combined into a feature vector. Two trained scikit-learn models, the support gate and the contradiction gate, each independently decide whether the aggregated evidence is strong enough to call the claim supported or contradicted, using thresholds tuned during training (see the evaluation table below).
+| Component | Part | Role |
+|---|---|---|
+| Compute | Raspberry Pi 4B | edge inference node |
+| Camera | USB UVC webcam | video frames |
+| Motion | HC-SR501 PIR | wake / presence signal |
+| Light | LM393 comparator module | dark/bright gate for CLAHE |
+| Distance | HC-SR04 ultrasonic | subject distance → model selection |
+| Power measurement | Inline USB-C power meter (display) | whole-Pi power for the energy figure — read by hand, off the Pi |
 
-### 6. Final Verdict & UI
-The gate outputs, together with the raw evidence and signal telemetry, are passed to a backend reasoning engine (Gemini) that applies the final decision rules and produces one of three verdicts — SUPPORTED, CONTRADICTED, or UNVERIFIED — along with a short explanation. Everything is rendered in the Streamlit UI: the verdict itself, the evidence snippets it was based on, and a full "Signal Telemetry" panel exposing every underlying score (TF-IDF, NLI entailment/contradiction, CLIP relevance, deepfake probability, recognized entities) so the result isn't a black box.
+### Sensor → GPIO wiring (BCM numbering)
 
-### Outcome
-Rather than returning a single fake/real label from text alone, JaankaarAI produces a verdict that is traceable back to actual retrieved evidence and, where relevant, cross-checked against the accompanying image — which is particularly useful for regional-language misinformation that often pairs a plausible-sounding local claim with a repurposed photo or video still. The explainability panel means a user (or moderator) reviewing a verdict can see exactly which articles were used, how similar or contradictory they were, and whether the image itself raised any red flags, rather than having to trust the verdict blindly.
+| Sensor | Signal | Pi pin | Notes |
+|---|---|---|---|
+| HC-SR501 PIR | OUT | GPIO 17 (pin 11) | 5V supply; output already 3.3V-safe |
+| LM393 light | DO | GPIO 27 (pin 13) | 3.3V supply; **HIGH = dark** on this module (LM393 polarity varies — set by `LDR_DARK_LEVEL`); hardware hysteresis via onboard pot |
+| HC-SR04 | TRIG | GPIO 23 (pin 16) | direct connection |
+| HC-SR04 | ECHO | GPIO 24 (pin 18) | **via 1kΩ/2kΩ voltage divider** (steps the 5V echo down to 3.3V) |
+
+### Power rails
+
+| Rail | Powers | Pi pins |
+|---|---|---|
+| 5V | HC-SR501, HC-SR04 | 2, 4 |
+| 3.3V | LM393 | 1, 17 |
+| GND | all sensor grounds + divider leg | 6, 9, 14, 20, 25, 30, 34, 39 |
+
+### Power measurement (external, off the Pi)
+
+Whole-Pi power is measured with a **standalone inline USB-C power meter** that plugs between the wall charger and the Pi's USB-C power port and shows live volts/amps/watts on its own display. It taps nothing on the GPIO header and runs no code — the watts are **read by hand off its display** and noted alongside each benchmark run. This replaces the earlier INA219 shunt rig (no soldering, no CC-resistor bring-up, no I²C).
+
+> See [`docs/HARDWARE_CONNECTIONS.md`](docs/HARDWARE_CONNECTIONS.md) for the meter placement, and [`docs/TESTING.md`](docs/TESTING.md) for how power is logged during a run.
+
+---
+
+## Sensing & Presence Fusion
+
+Each sensor has a distinct role, and the readings are filtered before use:
+
+- **Ultrasonic (primary):** each reading is spike-rejected (a jump beyond `MAX_PLAUSIBLE_JUMP_CM` is dropped unless it persists for several samples) then median-filtered over 5 samples, to absorb multipath bounce off walls/furniture.
+- **PIR:** a motion / wake trigger only.
+- **LDR (LM393):** the CLAHE low-light gate (digital dark/bright).
+
+**Keep-awake is a logical OR; the expensive state is not.** Any one signal — PIR motion, an ultrasonic **deviation from the static background** (`|distance − background| > SONAR_BG_DELTA_CM`, ~30 cm), or a YOLO person-detection (the **vision vote**) — keeps the node *awake*; absence is declared only when **all three** have been quiet for `PRESENCE_TIMEOUT_S` (~12 s). The vision vote is what distinguishes a **still occupant** (no motion, but detected) from an empty room — the failure mode of motion-only systems.
+
+> **Why a deviation, not an absolute distance?** A rangefinder never sees an empty room — a wall, furniture, or a sensor artifact always returns *something*, so an absolute `distance < threshold` is permanently true and the node can never declare absence. Sonar presence is therefore **background subtraction**: a person is a *change* from the learned empty-scene distance, and any constant reading is absorbed into the background and stops holding the node awake. See `docs/ENGINEERING_LOG.md` (P10).
+
+But the three signals are **not equally trustworthy**, so they do not equally unlock the expensive ACTIVE-HI state (**tiered presence**):
+
+| Signal | Confirms | Unlocks ACTIVE-HI? |
+|---|---|---|
+| **Vision** (confident person) | a *person* | yes — holds HI, and arbitrates the others |
+| **Proximity** (a sonar deviation from background) | a real *object* (maybe furniture) | only a **time-limited HI probe** — demoted to LO if vision stays silent |
+| **PIR** (motion) | a heat/motion *change* (maybe sunlight) | no — wakes + keeps a cheap LO probe only |
+
+This bounds the cost of any single false positive (a spurious PIR from sunlight) to the cheap LO probe, while still giving a genuinely *far* person the high-resolution look needed to detect them. (Static furniture no longer even reaches this stage — it is absorbed into the sonar background and stops voting presence entirely; P10.) And because the LO probe keeps running inference, a person who later (re-)appears is re-detected by the vision vote and escalated back to HI — the demotion is **self-correcting**. See `docs/ENGINEERING_LOG.md` (P9) for the worked edge cases.
+
+---
+
+## The 5-State FSM
+
+Inference is controlled through a 5-state finite state machine.
+
+<img width="1536" height="1024" alt="state diagram" src="https://github.com/user-attachments/assets/7ed6ef6c-069a-4ba8-8faa-61dcaa48797a" />
+
+1. **SLEEP** — no inference; the loop polls at ~0.5 s watching for a wake signal. Exits to **STANDBY** when the PIR fires or the ultrasonic reading **deviates from the learned background by more than `SONAR_WAKE_DELTA_CM`** (~45 cm — a real change in the scene, not a constant echo), held long enough to pass the debounce gate.
+2. **STANDBY** — a transitional state entered on waking; no inference. Polls fast (~0.05 s) to clear a brief warm-up (`STANDBY_WARMUP_S`, ~200 ms), then **always enters ACTIVE-LO** (it no longer branches on distance — see ACTIVE-LO for why).
+3. **ACTIVE-LO** — object present and **close** (`distance < HILO_CLOSE_CM`, ~120 cm). Runs the **320×320** model: a close subject is large in frame, so low resolution suffices and is cheap. The loop is **frame-rate-capped (~0.15 s)** — a cheap model only saves power if the rate is also capped, otherwise it pegs the CPU just like the always-on baseline. ACTIVE-LO is also the **wake-entry** state (the node always exits STANDBY into ACTIVE-LO regardless of distance, so the first frames after a wake are captured immediately at low resolution; a far subject is then escalated to ACTIVE-HI by the gate) and the **wind-down** state (ACTIVE-HI drops here when presence has been quiet for over ~2 s). Exits to ACTIVE-HI if the target moves far, or to SLEEP once presence is absent (> ~12 s).
+4. **ACTIVE-HI** — object present but **far** (`distance ≥ HILO_FAR_CM`, ~160 cm). Runs the **640×640** model: a distant/small subject needs the higher resolution, but it is expensive (~1 s/frame on the Pi), so the loop is paced slow (~0.40 s). Exits to ACTIVE-LO when the target comes close or presence goes quiet.
+5. **WATCHDOG** — entered from any state immediately on sensor-health failure: a `pigpio` fault, no valid ultrasonic echo for > 2 s, or ≥ 3 consecutive dropped echo readings. Captured frames are CLAHE-preprocessed and inferred with the 640×640 model (worst-case assumption: far and dark). Exits to STANDBY only after the sensors stay healthy for ~1.5 s, so a marginal/flaky sensor cannot flap WATCHDOG ↔ ACTIVE.
+
+> **Hysteresis note:** the close (`HILO_CLOSE_CM`, ~120 cm) and far (`HILO_FAR_CM`, ~160 cm) thresholds differ on purpose — the 120–160 cm gap is a hysteresis band that, together with the transition gate below, stops the model flickering HI↔LO at the boundary.
+
+> **Wake-latency note:** on every wake the node enters ACTIVE-LO first, so the first detection appears as soon as a fast 320 frame completes (~0.7–0.9 s after the wake signal) instead of waiting on a slow 640 frame (~1.5 s). The node prints a `[WAKE] first inference … ms after wake signal` line so this latency can be measured directly (`test/analyze_log.py` reports it).
+
+---
+
+## Robustness / Anti-Flap
+
+State decisions are debounced by a single timed **TransitionGate**: an edge commits only when its condition has held continuously for `hold_s` **and** the current state has been occupied for at least `dwell_s`. Timing the streak (rather than counting loop ticks) makes the debounce behave identically regardless of how fast the loop runs in each state.
+
+The gate guards every flicker-prone edge:
+
+- **HI ↔ LO** — condition held `HILO_HOLD_S` (~0.75 s) and ≥ `HILO_DWELL_S` (~1.5 s) in-state.
+- **SLEEP wake** — hysteretic (wake needs a larger background deviation, `SONAR_WAKE_DELTA_CM` ~45 cm; keep-awake needs only the smaller `SONAR_BG_DELTA_CM` ~30 cm) and confirmed (`WAKE_HOLD_S`), so a stray PIR pulse can't wake the node.
+- **WATCHDOG recovery** — sticky: leave only after the sonar stays healthy for `WATCHDOG_RECOVER_HOLD_S` and the minimum dwell elapses, so a marginal sensor can't flap the failsafe.
+
+---
+
+## Inference Engine
+
+Inference runs on **`tflite-runtime`** (the lightweight CPU interpreter — not `ultralytics`/`torch`, which are too heavy for the Pi), using **full-integer INT8 YOLOv8-nano** models. INT8 is chosen for the Pi 4B's ARM Neon SIMD unit, which does INT8 multiply-accumulate faster than FP32 and at lower memory bandwidth.
+
+Because a full-integer INT8 model bakes its input resolution in at export time, the adaptive 320/640 switch is achieved by loading **two models** (one per resolution) and selecting the matching interpreter per FSM state. The pre/post-processing that `ultralytics` would do internally is reimplemented by hand in NumPy/OpenCV: **letterbox → quantize → invoke → dequantize → decode the YOLOv8 head → NMS → map boxes back to the original frame's pixels**. Model export to `.tflite` is done off-device.
+
+### CLAHE Preprocessing
+
+Orthogonal to the 5 states, the captured frame is enhanced when the LDR reports darkness (HIGH output on this module). The BGR frame is converted to YUV and CLAHE is applied to the **Y (brightness) channel only**, leaving chroma (U, V) untouched so colour is not distorted — then converted back.
+
+- `tileGridSize = (8, 8)` — splits the frame into an 8×8 grid (64 tiles, ~80×60 px each on a 640×480 frame), equalising each tile against its own local histogram (bilinearly interpolated across tiles to avoid blocky seams).
+- `clipLimit = 2.0` — the contrast cap. The histogram has 256 bins (8-bit Y); OpenCV clips each bin at `clipLimit × (tile_pixels / 256)` ≈ 2× the average bin height (~4800 px/tile ÷ 256 ≈ 19 px → clip at ~38 px), then redistributes the excess. This bounds the slope of the equalisation curve, which stops near-flat dark regions from amplifying sensor noise. `2.0` is a deliberately mild value.
+
+WATCHDOG forces CLAHE on regardless (worst-case low-light assumption).
+
+---
+
+## Concurrency: Threading & Core Pinning
+
+To manage the Pi's limited compute and prevent jitter in frame capture and inference, work is split across threads and pinned to specific cores with `os.sched_setaffinity`:
+
+| Core | Responsibility |
+|---|---|
+| 0 | OS tasks + (optional) snapshot writing and cloud telemetry upload |
+| 1 | Sensor I/O (GPIO harvester) |
+| 2 & 3 | Camera capture, CLAHE, FSM-based inference (`tflite-runtime`), and GUI — run sequentially |
+
+The implementation uses up to **6 threads** — **4 run by default**, plus 2 that start only with their opt-in flags:
+
+- **Main** — launches the worker threads and parks until a shutdown event or `Ctrl+C`.
+- **GPIO harvester** — continuously samples PIR, LM393 (LDR), and HC-SR04 (ultrasonic).
+- **Vision engine** — camera capture, CLAHE, YOLOv8 inference, and GUI.
+- **pigpio echo callback** — runs in pigpio's own real-time thread (the ISR equivalent), timestamping ultrasonic echo edges.
+- **Cloud uploader** *(opt-in, `--cloud`)* — uploads telemetry to ThingSpeak.
+- **Snapshot writer** *(opt-in, `--snapshots`)* — writes detection frames to the SD card.
+
+Cross-thread communication:
+
+| Channel | Type | Between |
+|---|---|---|
+| `echo_lock` | mutex | pigpio echo callback ⇄ GPIO harvester |
+| shared sensor state | mutex | GPIO harvester ⇄ vision engine |
+| `_latest_record_lock` | mutex | vision engine ⇄ cloud uploader |
+| `_snapshot_queue` | bounded queue (drop-oldest) | vision engine ⇄ snapshot writer |
+
+The hot threads (sensors, vision) never block on slow I/O — they hand work to the background threads via a latest-value snapshot (sensor state, telemetry record) or a bounded queue (snapshots). This scales across cores despite Python's GIL because the heavy sections (TFLite `invoke()`, OpenCV, socket I/O) release the GIL and run as true native parallel work.
+
+---
+
+## Telemetry, Cloud & GUI
+
+Every loop the vision thread assembles **one telemetry record** (a dict) and fans it out to non-blocking sinks (so a sink can never stall the FSM). The record:
+
+| Field | Description |
+|---|---|
+| `state` | FSM state (`SLEEP` / `STANDBY` / `ACTIVE-LO` / `ACTIVE-HI` / `WATCHDOG`) |
+| `model_res` | inference resolution / model used (`320`, `640`, or `---` when idle) |
+| `latency_ms` | per-frame inference duration |
+| `cpu_pct`, `cpu_temp_c` | CPU utilisation % and core temperature °C |
+| `distance_cm` | median ultrasonic distance |
+| `detections` | list of `(label, confidence%)` |
+
+The default sink is the **terminal sink**, which prints one fixed-format line per loop to the Pi's own console — so the system runs fully offline:
+
+```
+[14:22:07] ACTIVE-LO | model 320 | lat   28.4ms | cpu 47.0% | temp 58.1C | dist   95.3cm | dets: Student/Person(94.2%)
+```
+
+### Optional sinks (off by default)
+
+- **`--cloud`** — a background thread POSTs latency / CPU-temp / distance to a ThingSpeak channel every 20 s (the free-tier rate limit). `emit_telemetry()` only stashes the latest record, so the network call never runs in the inference loop. The write key is read from a git-ignored `.env`. See [`docs/SETUP.md`](docs/SETUP.md), Phase 4.
+- **`--snapshots`** — on a person detection, a worker thread writes a JPEG of the frame to `./snapshots/` (ring-buffered to a file cap, filename carries timestamp/class/conf/state).
+
+> Both are opt-in and add Wi-Fi/disk activity, so keep them **off during measured benchmark runs** (they would bias the meter's whole-Pi reading).
+
+### On-Pi GUI (demo)
+
+For demos the node opens a local window on the Pi's HDMI monitor (default; pass `--headless` to disable it for remote deployment). It shows the live feed with **blue detection boxes** and a HUD header above the unobstructed video:
+
+```
+SAGE-Vision   ACTIVE-LO            ← state name colour-coded (green active / grey idle / red watchdog)
+Model 320 | Objects: 3 | 28 ms | 31 FPS
+cpu 47% | 58C | dist 95 cm
+```
+
+During SLEEP/STANDBY the video area shows a "SYSTEM IDLE" placeholder. Keys: **`q`** quits cleanly, **`f`** toggles fullscreen. The GUI runs inside the vision thread (Cores 2 & 3) and adds negligible cost.
+
+---
+
+## Power Measurement
+
+The headline metric — energy draw — is measured with a **standalone inline USB-C power meter** on the Pi's incoming 5V USB-C feed (see [Hardware & Wiring](#hardware--wiring)), so it reads the **whole-Pi** power draw. The meter shows live watts on its own display; the value is **read by hand and logged alongside each benchmark run** rather than flowing through the telemetry — the node itself does no power sensing. Power instrumentation is only for benchmarking; the node runs identically without the meter.
+
+---
+
+## Wake-Up Latency
+
+When a subject appears, the node is in SLEEP and inference only begins after it exits the low-power state — so the scene is *missed* for the duration of that exit. We define **wake-up latency** as the interval from the wake signal to the first completed inference (the first available detection):
+
+```
+T_wake = T_sample + T_confirm + T_warmup + T_infer
+```
+
+| Term | Meaning | Constant | Value |
+|---|---|---|---|
+| `T_sample` | delay to *observe* the wake signal (SLEEP poll period; uniform 0–period → mean = period/2) | SLEEP loop ≈ 0.5 s | ~0.25 s (mean) |
+| `T_confirm` | wake debounce hold (signal must persist) | `WAKE_HOLD_S` | 0.5 s |
+| `T_warmup` | STANDBY warm-up | `STANDBY_WARMUP_S` | 0.2 s |
+| `T_infer` | first inference time | 320 (LO-first) or 640 (HI-first) | ~0.19 s / ~0.76 s |
+
+The node measures the **deterministic** part — `T_confirm + T_warmup + T_infer` — directly: it timestamps the wake signal and prints `[WAKE] first inference … ms after wake signal`, which `test/analyze_log.py` aggregates (mean / min / max). The `T_sample` term (sampling jitter before the signal is observed) adds a further ≤ 0.5 s on top.
+
+**Effect of wake-into-low-resolution-first.** Entering ACTIVE-LO (320) on every wake instead of ACTIVE-HI (640) changes *only* `T_infer` — the other three terms are identical — so the improvement is exactly the difference in first-frame inference time:
+
+```
+ΔT_wake = T_infer(640) − T_infer(320) ≈ 0.76 − 0.19 = 0.57 s
+```
+
+| Wake strategy | `T_infer` | `T_wake` (mean) |
+|---|---|---|
+| HI-first (640) — *previous* | ~0.76 s | 0.25 + 0.5 + 0.2 + 0.76 = **~1.71 s** |
+| LO-first (320) — *current* | ~0.19 s | 0.25 + 0.5 + 0.2 + 0.19 = **~1.14 s** |
+
+→ **~0.57 s faster to first detection (~33 % lower wake latency)**, with the largest gain for distant subjects, which previously paid the full 640 cost on the very first frame. The inference figures use published Pi-4 YOLOv8n timings (~760 ms at 640, ~190 ms at 320); substitute your own measured `[WAKE]` values for the final numbers.
+
+---
+
+## Limitations & Future Work
+
+- The 640 INT8 model previously saturated (an INT8 calibration issue); it has been **re-exported with COCO128 calibration** (`rpi_edge/export_yolo_int8.py`) — verify on-device (Netron + a live run) before fully trusting ACTIVE-HI accuracy.
+- **PIR and LDR are not health-monitorable** — a dead pin reads as a quiet/lit room and is invisible to the WATCHDOG (only the ultrasonic sensor is observable). An *out-of-range* echo (an empty room) still returns a valid pulse and counts as healthy.
+- `is_dark` has **no software debounce**, so CLAHE can toggle frame-to-frame at the light threshold (it relies on the LM393's hardware hysteresis).
+- The median distance filter adds ~0.12 s of lag (accepted for stability).
+- The energy benefit is **not yet proven** — it requires a controlled measurement run against the baseline, with whole-Pi watts read off the inline USB-C meter for both.
+
+---
 
 ## Repository Structure
 
 ```
-jaankarAI/
-├── app/
-│   ├── app.py            # Current production app (final decision engine + UI)
-│   ├── app1.py – app4.py  # Iterative development snapshots (kept for reference)
-│   └── cache_key.py       # Retrieval cache key helper
-├── archive/
-│   ├── old_main/          # Earlier standalone pipeline versions (main_v1–v5)
-│   ├── old_ui/             # Earlier Streamlit UI iterations
-│   └── tests/              # Ad-hoc test/debug scripts
-├── data/
-│   ├── raw/                 # Training feature CSVs (v1–v3, RSS variant)
-│   ├── cache/                # Retrieval cache
-│   └── lexicon_out/           # Lexicon resources
-├── models/
-│   ├── weights/                # Trained model artifacts (.joblib)
-│   └── config/                  # Model metadata: features, thresholds, metrics
-├── plots/                        # Evaluation plots (ROC, PR, confusion, prob histograms)
-├── scripts/
-│   ├── preprocessing/             # Retrieval cache building, entity extraction
-│   └── training/                    # Feature building and model training scripts
-└── README.md
+SAGE-Vision/
+├── firmware/
+│   └── esp32_sensor_node/
+│       └── esp32_sensor_node.ino          # LEGACY — original ESP32 sensor transmitter (unused)
+├── rpi_edge/
+│   ├── pi_edge_node.py                    # Main adaptive inference node (reads GPIO sensors)
+│   ├── yolo_tflite.py                     # Lightweight tflite-runtime YOLOv8 detector
+│   ├── requirements.txt                   # Pi Python dependencies
+│   ├── .env.example                       # Template for the ThingSpeak key (copy to .env)
+│   ├── export_yolo_int8.py                # Off-device: re-export calibrated INT8 TFLite models
+│   ├── coco128.yaml                       # Calibration dataset config for the export
+│   ├── yolov8n_320_int8.tflite            # INT8 TFLite model — 320×320 (ACTIVE-LO)
+│   └── yolov8n_640_int8.tflite            # INT8 TFLite model — 640×640 (ACTIVE-HI / WATCHDOG)
+├── test/
+│   ├── test_baseline_edge.py              # Unoptimised control benchmark (terminal + GUI)
+│   └── analyze_log.py                     # Parse a captured telemetry log into per-run metrics
+├── docs/
+│   ├── SETUP.md                           # Installation and execution guide
+│   ├── TESTING.md                         # Benchmarking and validation procedure
+│   ├── HARDWARE_CONNECTIONS.md            # Wiring tables for all sensors + power-meter placement
+│   └── ENGINEERING_LOG.md                 # Problems faced, solutions, tradeoffs, limitations
+├── snapshots/                             # Detection JPEGs (created at runtime; git-ignored)
+├── .env.example                           # Template for the ThingSpeak key (copy to .env)
+├── .gitignore
+└── README.md                              # This file — project overview & architecture
 ```
 
-## Models & Evaluation
+### Documentation
 
-Three trained classifiers drive the decision layer (see `models/config/*_meta.json` and `plots/metrics_summary.json` for full details):
+- [docs/SETUP.md](docs/SETUP.md) — installation and execution (HDMI or VNC display), plus the optional `--cloud` setup.
+- [docs/HARDWARE_CONNECTIONS.md](docs/HARDWARE_CONNECTIONS.md) — full wiring for every sensor and where the inline USB-C power meter goes.
+- [docs/TESTING.md](docs/TESTING.md) — benchmarking the adaptive node against the baseline.
 
-| Model | Purpose | Accuracy | F1 | AUC | Threshold |
-|---|---|---|---|---|---|
-| **Contradiction Gate** | Detects when evidence contradicts the claim | 0.991 | 0.944 | 0.998 | 0.70 |
-| **Support Gate** | Detects when evidence is strong enough to assert `SUPPORTED` | 0.963 | 0.00* | 0.716 | 0.35 |
-| **TF-IDF Style Model** | Character n-gram stylometry baseline | 0.419 | 0.165 | 0.321 | — |
+---
 
-\* The support gate is trained on a highly imbalanced auto-labeled set (55 positives / 1445 negatives); precision/recall at the default threshold are near-zero, so it is best treated as an auxiliary signal rather than a standalone classifier. Corresponding ROC, PR, confusion matrix, and probability histogram plots for each model are in `plots/`.
+## Key Design Decisions at a Glance
 
-## Getting Started
-
-### Prerequisites
-
-- Python 3.9+
-- API keys for the services you want to enable (all are optional and fail gracefully if missing):
-  - `NEWS_API_KEY`, `NEWSDATA_KEY`, `EVENTREGISTRY_KEY` — evidence retrieval
-  - `HF_TOKEN` — Hugging Face models (CLIP, BART-MNLI, LaBSE, NLLB)
-  - `AWS_KEY`, `AWS_SECRET`, `AWS_REGION` — AWS Rekognition
-  - `GEMINI_API_KEY` — backend reasoning/decision engine
-
-### Installation
-
-```bash
-git clone https://github.com/<your-username>/jaankarAI.git
-cd jaankarAI
-python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-> **Note:** This repo doesn't yet ship a `requirements.txt`. Core dependencies used across `app/app.py` include: `streamlit`, `torch`, `transformers`, `sentence-transformers` (LaBSE), `scikit-learn`, `joblib`, `numpy`, `pandas`, `Pillow`, `requests`, `feedparser`, `deep-translator`, `boto3`, `google-generativeai`, `gTTS`, and `openai-whisper`/`tensorflow` for audio and deepfake components. Pin versions as you finalize your environment and add a `requirements.txt` to the repo root.
-
-### Configuration
-
-Add your API keys either to Streamlit secrets (`.streamlit/secrets.toml`) or as environment variables:
-
-```toml
-NEWS_API_KEY = "..."
-NEWSDATA_KEY = "..."
-EVENTREGISTRY_KEY = "..."
-HF_TOKEN = "..."
-AWS_KEY = "..."
-AWS_SECRET = "..."
-AWS_REGION = "..."
-GEMINI_API_KEY = "..."
-```
-
-### Running the App
-
-```bash
-streamlit run app/app.py
-```
-
-Navigate between the **Home** page and the **Run Detector** page from the sidebar. On the detector page, submit a text claim (optionally with an image or audio) to get a verdict along with a full signal telemetry breakdown (TF-IDF scores, NLI entailment/contradiction, CLIP relevance, deepfake probability, and recognized entities).
-
-## Training Your Own Models
-
-Feature-building and training scripts are in `scripts/`:
-
-- `scripts/preprocessing/` — builds retrieval caches (`build_retrieval_cache_v2.py`, `build_retrieval_cache_rss.py`) and offline entity lexicons (`offline_build_india_entities.py`).
-- `scripts/training/` — builds feature tables (`build_training_features*.py`) and trains each model (`train_support_gate.py`, `train_contradiction_gate_v1.py`, `train_tfidf_style_model.py`, `train_fake_real_mlp_v3.py`).
-
-Trained artifacts are saved to `models/weights/`, and metadata (feature lists, thresholds, label stats) to `models/config/`.
-
-## Roadmap / Notes
-
-- `app/app1.py`–`app4.py` are retained development snapshots showing the system's evolution (from a text-only baseline to multilingual query generation with Whisper transcription and retrieval telemetry). `app/app.py` is the current entry point.
-- `archive/` holds older pipeline (`main_v1`–`v5`) and UI iterations for historical reference — not required to run the current app.
-- The support gate would benefit from a more balanced training set; contributions to relabeling or rebalancing are welcome.
-
-## Acknowledgements
-
-Built on top of open models and libraries including CLIP, BART-Large-MNLI, LaBSE, NLLB, Whisper, AWS Rekognition, and Google Gemini.
+| Decision | Rationale |
+|---|---|
+| On-Pi terminal telemetry + local GUI, offline by default | No network in the live path, no frame-encoding overhead, no second machine |
+| Telemetry record + non-blocking sinks | Terminal always; cloud/snapshot sinks drop in without touching the FSM |
+| Direct GPIO sensors via `pigpio` | Removes the ESP32 and serial link; hardware-timestamped echo edges keep distance accurate |
+| Two pinned threads + core affinity | Isolates GPIO sensor I/O jitter from the inference loop's timing |
+| Sensor-fused presence (PIR ∨ sonar-deviation ∨ vision vote) | A still person is invisible to PIR alone; fusion prevents false SLEEP. Sonar votes on a *deviation from background*, not an absolute distance, so a wall/phantom can't pin the node awake (P10) |
+| Timed TransitionGate on every edge | Debounce behaves identically regardless of per-state loop pace; kills flicker |
+| Two fixed-resolution INT8 models | Full-integer export bakes input size; switching models is the adaptive resolution |
+| INT8 TFLite over FP32 PyTorch | 2–4× lower inference time on ARM Neon; no GPU required |
+| CLAHE on luma over global brightness | Preserves local contrast for detection; global boost washes out fine edges |
