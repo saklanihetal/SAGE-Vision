@@ -58,10 +58,11 @@ consecutive_jump_count = 0
 # =========================================================================
 # PRESENCE FUSION + HYSTERESIS
 # =========================================================================
-# Absence is declared only when PIR motion, a close ultrasonic reading, AND a
-# recent vision person-detection have ALL been quiet for PRESENCE_TIMEOUT_S.
-# This replaces the old "PIR-expired AND far" rule, which mistook a stationary
-# occupant plus one spurious sonar spike for an empty room.
+# Absence is declared only when PIR motion, a sonar deviation from the static
+# background, AND a recent vision person-detection have ALL been quiet for
+# PRESENCE_TIMEOUT_S. The sonar term is a *deviation*, not an absolute distance:
+# an absolute threshold never clears (a rangefinder always sees the room), which
+# is why the node used to stay awake forever against a wall or a stuck phantom.
 PRESENCE_TIMEOUT_S = 12.0
 PERSON_CLASS_ID    = 0            # YOLO/COCO dense index for "person"
 
@@ -78,12 +79,21 @@ VISION_VOTE_CONF  = 0.50          # min person-detection confidence to count as 
 CONFIRM_TIMEOUT_S = 5.0           # a vision detection confirms presence for this long
 PROXIMITY_PROBE_S = 8.0           # proximity-only HI probe window before demoting to LO
 
-# Distance hysteresis between waking and staying awake. A target must step
-# inside WAKE_DISTANCE_CM to wake the node from SLEEP, but presence is kept
-# alive out to the wider PRESENCE_DISTANCE_CM. The gap stops a target lingering
-# near the boundary from repeatedly re-crossing the wake line.
-WAKE_DISTANCE_CM     = 300.0      # closer threshold: wake from SLEEP
-PRESENCE_DISTANCE_CM = 350.0      # wider threshold: keep-awake / presence vote
+# Sonar presence via BACKGROUND SUBTRACTION, not an absolute distance. A
+# rangefinder never sees an empty room: a wall, furniture, or a self-trigger
+# artifact always returns *something*, so "distance < threshold" is permanently
+# true and can never mean "someone is here" -- which is exactly why the node
+# could never reach SLEEP. Instead we learn the static background distance and
+# vote presence only on a DEVIATION from it: a person is a change in the scene,
+# not the mere existence of an echo. Any constant reading (a wall, a stuck
+# phantom, a blind self-trigger) is absorbed into the background and stops
+# holding the node awake, so absence can finally be declared.
+#
+# Hysteresis is expressed as two deviation bands -- waking needs a bigger change
+# than staying awake -- mirroring the old WAKE(tight)/PRESENCE(wide) pair.
+SONAR_BG_DELTA_CM   = 30.0        # keep-alive: deviation from background that counts as a target
+SONAR_WAKE_DELTA_CM = 45.0        # wake-from-SLEEP: larger deviation required (harder to wake)
+SONAR_BG_EMA_ALPHA  = 0.01        # background relearn rate (slow: ~tens of seconds to absorb)
 
 # Two-stage low-power wind-down. When presence goes quiet we do NOT jump straight
 # from the expensive ACTIVE-HI to SLEEP. After PRESENCE_GRACE_S of quiet we drop
@@ -648,6 +658,7 @@ def adaptive_vision_streamer():
     # signal; last_person_epoch is the vision vote, refreshed when YOLO sees a person.
     last_presence_epoch = time.time()
     last_person_epoch = 0.0
+    sonar_background_cm = None      # learned empty-scene distance; seeded on first read (bg subtraction)
     proximity_probe_start = None   # start of a proximity-only HI probe episode (P9)
     wake_signal_epoch = None       # stamped in SLEEP when a wake signal first appears;
                                    # used to time wake-signal -> first inference latency
@@ -700,12 +711,27 @@ def adaptive_vision_streamer():
             is_dark = shared_state["is_dark"]
             last_motion = shared_state["last_motion_epoch"]
 
-        # Presence stays alive if ANY signal fires: PIR motion, a close sonar
-        # reading, or a recent vision person-detection. quiet_for then drives the
-        # two-stage wind-down (grace -> cheap LO, timeout -> SLEEP).
+        # Presence stays alive if ANY signal fires: PIR motion, a sonar DEVIATION
+        # from the static background, or a recent vision person-detection.
+        # quiet_for then drives the two-stage wind-down (grace -> cheap LO,
+        # timeout -> SLEEP).
         last_presence_epoch = max(last_presence_epoch, last_motion, last_person_epoch)
-        if distance < PRESENCE_DISTANCE_CM:
+
+        # Sonar background subtraction. A person is a change from the empty-scene
+        # distance, not the presence of any echo, so we vote presence only on a
+        # deviation past SONAR_BG_DELTA_CM. The background itself is tracked with a
+        # slow EMA (seeded on the first read) so a wall, moved furniture, or a
+        # stuck 9cm phantom is absorbed within tens of seconds and stops holding
+        # the node awake. The EMA is slow enough that a normal occupant is
+        # refreshed by PIR/vision long before sonar forgets them.
+        if sonar_background_cm is None:
+            sonar_background_cm = distance
+        sonar_deviation = abs(distance - sonar_background_cm)
+        sonar_present   = sonar_deviation > SONAR_BG_DELTA_CM
+        if sonar_present:
             last_presence_epoch = now
+        sonar_background_cm += SONAR_BG_EMA_ALPHA * (distance - sonar_background_cm)
+
         quiet_for    = now - last_presence_epoch
         winding_down = quiet_for > PRESENCE_GRACE_S      # quiet -> cheap LO wind-down
         absent       = quiet_for > PRESENCE_TIMEOUT_S    # quiet long enough -> SLEEP
@@ -715,7 +741,7 @@ def adaptive_vision_streamer():
         # silent; PIR alone never reaches here. (Presence/keep-awake is separate above --
         # proximity still sustains the awake state at LO even after the probe expires.)
         vision_fresh  = (now - last_person_epoch) < CONFIRM_TIMEOUT_S
-        proximity_now = distance < PRESENCE_DISTANCE_CM
+        proximity_now = sonar_present          # a real object is a deviation from bg, not any static echo
         if not proximity_now or vision_fresh:
             proximity_probe_start = None          # no object, or vision is carrying it
         elif proximity_probe_start is None:
@@ -727,9 +753,10 @@ def adaptive_vision_streamer():
         # STEP C: FSM TRANSITIONS (every debounced edge goes through the gate)
         # -----------------------------------------------------------------
         if current_state == STATE_SLEEP:
-            # Wake on sustained motion or a target stepping inside WAKE_DISTANCE_CM.
+            # Wake on sustained motion or a sonar deviation past the (larger) wake
+            # band -- a genuine change in the static scene, not a constant echo.
             # The gate's hold requirement filters single stray PIR pulses / blips.
-            wake_signal = (pir == 1) or (distance < WAKE_DISTANCE_CM)
+            wake_signal = (pir == 1) or (sonar_deviation > SONAR_WAKE_DELTA_CM)
             if wake_signal:
                 if wake_signal_epoch is None:     # stamp the moment the signal appears,
                     wake_signal_epoch = now       # so wake latency spans the full exit

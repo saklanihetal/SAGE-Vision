@@ -67,17 +67,19 @@ Each sensor has a distinct role, and the readings are filtered before use:
 - **PIR:** a motion / wake trigger only.
 - **LDR (LM393):** the CLAHE low-light gate (digital dark/bright).
 
-**Keep-awake is a logical OR; the expensive state is not.** Any one signal — PIR motion, a close ultrasonic reading (`distance < PRESENCE_DISTANCE_CM`, ~350 cm), or a YOLO person-detection (the **vision vote**) — keeps the node *awake*; absence is declared only when **all three** have been quiet for `PRESENCE_TIMEOUT_S` (~12 s). The vision vote is what distinguishes a **still occupant** (no motion, but detected) from an empty room — the failure mode of motion-only systems.
+**Keep-awake is a logical OR; the expensive state is not.** Any one signal — PIR motion, an ultrasonic **deviation from the static background** (`|distance − background| > SONAR_BG_DELTA_CM`, ~30 cm), or a YOLO person-detection (the **vision vote**) — keeps the node *awake*; absence is declared only when **all three** have been quiet for `PRESENCE_TIMEOUT_S` (~12 s). The vision vote is what distinguishes a **still occupant** (no motion, but detected) from an empty room — the failure mode of motion-only systems.
+
+> **Why a deviation, not an absolute distance?** A rangefinder never sees an empty room — a wall, furniture, or a sensor artifact always returns *something*, so an absolute `distance < threshold` is permanently true and the node can never declare absence. Sonar presence is therefore **background subtraction**: a person is a *change* from the learned empty-scene distance, and any constant reading is absorbed into the background and stops holding the node awake. See `docs/ENGINEERING_LOG.md` (P10).
 
 But the three signals are **not equally trustworthy**, so they do not equally unlock the expensive ACTIVE-HI state (**tiered presence**):
 
 | Signal | Confirms | Unlocks ACTIVE-HI? |
 |---|---|---|
 | **Vision** (confident person) | a *person* | yes — holds HI, and arbitrates the others |
-| **Proximity** (<350 cm) | a real *object* (maybe furniture) | only a **time-limited HI probe** — demoted to LO if vision stays silent |
+| **Proximity** (a sonar deviation from background) | a real *object* (maybe furniture) | only a **time-limited HI probe** — demoted to LO if vision stays silent |
 | **PIR** (motion) | a heat/motion *change* (maybe sunlight) | no — wakes + keeps a cheap LO probe only |
 
-This bounds the cost of any single false positive (a spurious PIR from sunlight, or static furniture within range) to the cheap LO probe, while still giving a genuinely *far* person the high-resolution look needed to detect them. And because the LO probe keeps running inference, a person who later (re-)appears is re-detected by the vision vote and escalated back to HI — the demotion is **self-correcting**. See `docs/ENGINEERING_LOG.md` (P9) for the worked edge cases.
+This bounds the cost of any single false positive (a spurious PIR from sunlight) to the cheap LO probe, while still giving a genuinely *far* person the high-resolution look needed to detect them. (Static furniture no longer even reaches this stage — it is absorbed into the sonar background and stops voting presence entirely; P10.) And because the LO probe keeps running inference, a person who later (re-)appears is re-detected by the vision vote and escalated back to HI — the demotion is **self-correcting**. See `docs/ENGINEERING_LOG.md` (P9) for the worked edge cases.
 
 ---
 
@@ -87,8 +89,10 @@ Inference is controlled through a 5-state finite state machine.
 
 <img width="1619" height="972" alt="5 state fsm" src="https://github.com/user-attachments/assets/7e3044b8-8719-41cb-9517-a6dd5209a878" />
 
+> **Diagram note (pending re-render):** the **SLEEP → STANDBY** and **ACTIVE-LO → SLEEP** edges are gated by a sonar **deviation from the learned background**, not the old absolute `distance < WAKE_DISTANCE_CM` / `distance < PRESENCE_DISTANCE_CM` labels (P10). Read the wake edge as *"PIR ∨ sonar-deviation > 45 cm"* and the sleep edge as *"all presence signals quiet 12 s (sonar reads its background)."*
 
-1. **SLEEP** — no inference; the loop polls at ~0.5 s watching for a wake signal. Exits to **STANDBY** when the PIR fires or the ultrasonic detects an object within `WAKE_DISTANCE_CM` (~300 cm), held long enough to pass the debounce gate.
+
+1. **SLEEP** — no inference; the loop polls at ~0.5 s watching for a wake signal. Exits to **STANDBY** when the PIR fires or the ultrasonic reading **deviates from the learned background by more than `SONAR_WAKE_DELTA_CM`** (~45 cm — a real change in the scene, not a constant echo), held long enough to pass the debounce gate.
 2. **STANDBY** — a transitional state entered on waking; no inference. Polls fast (~0.05 s) to clear a brief warm-up (`STANDBY_WARMUP_S`, ~200 ms), then **always enters ACTIVE-LO** (it no longer branches on distance — see ACTIVE-LO for why).
 3. **ACTIVE-LO** — object present and **close** (`distance < HILO_CLOSE_CM`, ~120 cm). Runs the **320×320** model: a close subject is large in frame, so low resolution suffices and is cheap. The loop is **frame-rate-capped (~0.15 s)** — a cheap model only saves power if the rate is also capped, otherwise it pegs the CPU just like the always-on baseline. ACTIVE-LO is also the **wake-entry** state (the node always exits STANDBY into ACTIVE-LO regardless of distance, so the first frames after a wake are captured immediately at low resolution; a far subject is then escalated to ACTIVE-HI by the gate) and the **wind-down** state (ACTIVE-HI drops here when presence has been quiet for over ~2 s). Exits to ACTIVE-HI if the target moves far, or to SLEEP once presence is absent (> ~12 s).
 4. **ACTIVE-HI** — object present but **far** (`distance ≥ HILO_FAR_CM`, ~160 cm). Runs the **640×640** model: a distant/small subject needs the higher resolution, but it is expensive (~1 s/frame on the Pi), so the loop is paced slow (~0.40 s). Exits to ACTIVE-LO when the target comes close or presence goes quiet.
@@ -107,7 +111,7 @@ State decisions are debounced by a single timed **TransitionGate**: an edge comm
 The gate guards every flicker-prone edge:
 
 - **HI ↔ LO** — condition held `HILO_HOLD_S` (~0.75 s) and ≥ `HILO_DWELL_S` (~1.5 s) in-state.
-- **SLEEP wake** — hysteretic (wake at `WAKE_DISTANCE_CM`, stay awake out to the wider `PRESENCE_DISTANCE_CM`) and confirmed (`WAKE_HOLD_S`), so a stray PIR pulse can't wake the node.
+- **SLEEP wake** — hysteretic (wake needs a larger background deviation, `SONAR_WAKE_DELTA_CM` ~45 cm; keep-awake needs only the smaller `SONAR_BG_DELTA_CM` ~30 cm) and confirmed (`WAKE_HOLD_S`), so a stray PIR pulse can't wake the node.
 - **WATCHDOG recovery** — sticky: leave only after the sonar stays healthy for `WATCHDOG_RECOVER_HOLD_S` and the minimum dwell elapses, so a marginal sensor can't flap the failsafe.
 
 ---
@@ -295,7 +299,7 @@ SAGE-Vision/
 | Telemetry record + non-blocking sinks | Terminal always; cloud/snapshot sinks drop in without touching the FSM |
 | Direct GPIO sensors via `pigpio` | Removes the ESP32 and serial link; hardware-timestamped echo edges keep distance accurate |
 | Two pinned threads + core affinity | Isolates GPIO sensor I/O jitter from the inference loop's timing |
-| Sensor-fused presence (PIR ∨ proximity ∨ vision vote) | A still person is invisible to PIR alone; fusion prevents false SLEEP |
+| Sensor-fused presence (PIR ∨ sonar-deviation ∨ vision vote) | A still person is invisible to PIR alone; fusion prevents false SLEEP. Sonar votes on a *deviation from background*, not an absolute distance, so a wall/phantom can't pin the node awake (P10) |
 | Timed TransitionGate on every edge | Debounce behaves identically regardless of per-state loop pace; kills flicker |
 | Two fixed-resolution INT8 models | Full-integer export bakes input size; switching models is the adaptive resolution |
 | INT8 TFLite over FP32 PyTorch | 2–4× lower inference time on ARM Neon; no GPU required |
